@@ -162,6 +162,8 @@ Camus intentionally does not provide:
 ## Documentation
 
 - [Usage guide](docs/usage.md): end-to-end API composition and common mistakes.
+- [Runnable examples](examples/README.md): restart replay, multi-stream
+  draining, async readiness, and maintenance patterns.
 - [File format](docs/file-format.md): normative version-1 byte layouts,
   checksums, manifest schemas, repair boundaries, and stable vectors.
 - [Architecture](docs/architecture.md): durability, recovery, ordering, and
@@ -232,6 +234,9 @@ cargo deny --locked check -A license-not-encountered licenses sources
 cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
 cargo package --locked
 ```
+
+The runnable examples are exercised in CI and catalogued in
+[examples/README.md](examples/README.md).
 
 Pull requests are checked for a semantic title and run formatting, Clippy,
 documentation, release-package, fuzz-target build, and locked test checks.

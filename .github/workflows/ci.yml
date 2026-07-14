@@ -34,6 +34,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
+      - name: Runnable examples
+        run: |
+          cargo run --locked --example durable_replay
+          cargo run --locked --example multi_stream
+          cargo run --locked --example readiness
+          cargo run --locked --example maintenance
       - name: Release-mode tests
         run: cargo test --locked --release --lib --tests
       - name: Check fuzz targets

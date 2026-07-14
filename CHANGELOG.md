@@ -24,5 +24,7 @@ version numbers.
   consumers.
 - End-to-end usage guidance for multi-stream append, bounded draining, async
   readiness, replay, release, maintenance, and poisoned-handle recovery.
+- Runnable examples for restart replay, bounded multi-stream draining,
+  runtime-neutral readiness, and scheduled or pressure-driven maintenance.
 - Deterministic crash-window tests, segment and manifest fuzz targets,
   cross-process ownership tests, and poisoned-handle recovery semantics.
