@@ -1,0 +1,28 @@
+[package]
+name = "camus-benchmarks"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+license = "Apache-2.0"
+
+[features]
+# Keep the native RocksDB dependency strictly opt-in.
+default = ["redb-engine"]
+redb-engine = ["dep:redb"]
+rocksdb-engine = ["dep:rocksdb"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+camus = { path = ".." }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+redb = { version = "4.1", optional = true }
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
