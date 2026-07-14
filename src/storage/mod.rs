@@ -19,12 +19,12 @@ use crate::model::{
 use files::{
     acquire_lock, atomic_replace, ensure_root_directory, ensure_segments_directory, file_len,
     parse_segment_name, parse_segment_temporary_name, read_complete_file, segment_path,
-    sync_directory, CHECKPOINT_FILE, MANIFEST_LOG_FILE, ROOT_FILE, ROOT_TEMP_FILE,
+    sync_directory, RootLock, CHECKPOINT_FILE, MANIFEST_LOG_FILE, ROOT_FILE, ROOT_TEMP_FILE,
 };
 use manifest::{checkpoint_from_state, ControlRecovery, Manifest};
 use segment::{validate_removed_segment_header, PreparedEpoch, Segment};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -84,7 +84,7 @@ pub(crate) struct Storage {
     config: Config,
     root_id: RootId,
     #[allow(dead_code)]
-    lock: File,
+    lock: RootLock,
     segments_directory: PathBuf,
     manifest: Manifest,
     segments: BTreeMap<u64, Segment>,
@@ -135,7 +135,7 @@ impl Storage {
     fn recover_segments(
         config: Config,
         root_id: RootId,
-        lock: File,
+        lock: RootLock,
         segments_directory: PathBuf,
         mut control: ControlRecovery,
         removed_root_temporaries: u64,
