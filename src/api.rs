@@ -1,12 +1,16 @@
 use crate::config::{Capacity, Config, FullPolicy};
-use crate::error::{Error, Result};
+use crate::error::{DurabilityOutcome, Error, Result};
 use crate::model::{
-    PendingSnapshot, ReadLimits, ReclaimReport, Record, RecordId, RootId, Stats, StreamId,
-    StreamStats,
+    CommitStats, DurationStats, FailureInfo, MaintenanceStats, OperationCounters, OperationKind,
+    OperationStats, PendingSnapshot, PressureStats, ReadLimits, ReclaimReport, Record, RecordId,
+    RecoveryStats, RootHealth, RootId, RootState, RootStats, StorageStats, StreamId, StreamStats,
+    WaitStats,
 };
 use crate::runtime::{default_runtime, run_blocking, run_blocking_guarded, Runtime, RuntimeFuture};
-use crate::storage::{encoded_epoch_bytes, AppendUnit, CapacityCheck, ReleaseUnit, Storage};
-use std::collections::{BTreeMap, VecDeque};
+use crate::storage::{
+    encoded_epoch_bytes, AppendUnit, CapacityCheck, ReclaimKind, ReleaseUnit, Storage,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -34,6 +38,15 @@ pub struct Stream {
     id: StreamId,
 }
 
+/// A non-owning asynchronous watch of low-frequency root health transitions.
+///
+/// A watch coalesces intermediate changes and never backpressures the root
+/// reactor. It is an observability primitive, not a reliable event stream.
+#[derive(Clone)]
+pub struct HealthWatch {
+    receiver: watch::Receiver<RootHealth>,
+}
+
 #[derive(Clone, Copy)]
 struct Limits {
     capacity: Capacity,
@@ -47,7 +60,10 @@ struct Limits {
 
 #[derive(Clone, Eq, PartialEq)]
 struct View {
-    stats: Stats,
+    storage: StorageStats,
+    commits: CommitStats,
+    maintenance: MaintenanceStats,
+    recovery: RecoveryStats,
     known_streams: Vec<StreamId>,
     stream_stats: BTreeMap<StreamId, StreamStats>,
     highwaters: BTreeMap<StreamId, u64>,
@@ -57,6 +73,7 @@ struct Shared {
     sender: mpsc::Sender<Command>,
     shutdown: watch::Sender<bool>,
     events: watch::Sender<u64>,
+    health: watch::Sender<RootHealth>,
     view: RwLock<View>,
     root_id: RootId,
     limits: Limits,
@@ -65,10 +82,64 @@ struct Shared {
     reactor_finished: AtomicBool,
     active_storage_jobs: AtomicUsize,
     queue_depth: AtomicUsize,
-    admission_waiters: AtomicUsize,
-    admitted_operations: AtomicU64,
-    total_admission_wait_nanos: AtomicU64,
-    max_admission_wait_nanos: AtomicU64,
+    admitted_commands: AtomicU64,
+    command_queue_capacity: usize,
+    queue_wait: WaitCounters,
+    readiness_wait: WaitCounters,
+    capacity_wait: WaitCounters,
+    operations: AtomicOperationStats,
+    storage_job_elapsed: AtomicDurationStats,
+    detailed_observability: bool,
+}
+
+#[derive(Default)]
+struct AtomicDurationStats {
+    observations: AtomicU64,
+    total_nanos: AtomicU64,
+    max_nanos: AtomicU64,
+}
+
+#[derive(Default)]
+struct WaitCounters {
+    current: AtomicUsize,
+    waits: AtomicU64,
+    elapsed: AtomicDurationStats,
+}
+
+#[derive(Default)]
+struct AtomicOperationCounters {
+    started: AtomicU64,
+    succeeded: AtomicU64,
+    failed: AtomicU64,
+    cancelled: AtomicU64,
+    records: AtomicU64,
+    payload_bytes: AtomicU64,
+    elapsed: AtomicDurationStats,
+}
+
+#[derive(Default)]
+struct AtomicOperationStats {
+    append: AtomicOperationCounters,
+    read: AtomicOperationCounters,
+    release: AtomicOperationCounters,
+    reclaim: AtomicOperationCounters,
+}
+
+#[derive(Clone, Copy)]
+enum WaitKind {
+    Readiness,
+    Capacity,
+}
+
+struct WaitActivity<'a> {
+    counters: &'a WaitCounters,
+    started: Instant,
+}
+
+struct OperationActivity<'a> {
+    counters: &'a AtomicOperationCounters,
+    started: Option<Instant>,
+    finished: bool,
 }
 
 enum AppendReply {
@@ -113,11 +184,6 @@ enum Command {
     },
 }
 
-struct AdmissionWait<'a> {
-    shared: &'a Shared,
-    started: Instant,
-}
-
 struct ReactorTask {
     future: Option<RuntimeFuture>,
     termination: ReactorTermination,
@@ -131,6 +197,7 @@ struct ReactorTermination {
 struct StorageJobActivity {
     shared: Weak<Shared>,
     armed: bool,
+    started: Option<Instant>,
 }
 
 impl Log {
@@ -168,16 +235,19 @@ impl Log {
             ),
         };
         let queue_capacity = config.command_queue_capacity;
+        let detailed_observability = config.detailed_observability;
         let storage = run_blocking(runtime.clone(), move || Storage::open(config)).await??;
         let root_id = storage.root_id();
         let view = view_from_storage(&storage)?;
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let (events, _) = watch::channel(0_u64);
+        let (health, _) = watch::channel(RootHealth::default());
         let shared = Arc::new(Shared {
             sender,
             shutdown,
             events,
+            health,
             view: RwLock::new(view),
             root_id,
             limits,
@@ -186,10 +256,14 @@ impl Log {
             reactor_finished: AtomicBool::new(false),
             active_storage_jobs: AtomicUsize::new(0),
             queue_depth: AtomicUsize::new(0),
-            admission_waiters: AtomicUsize::new(0),
-            admitted_operations: AtomicU64::new(0),
-            total_admission_wait_nanos: AtomicU64::new(0),
-            max_admission_wait_nanos: AtomicU64::new(0),
+            admitted_commands: AtomicU64::new(0),
+            command_queue_capacity: queue_capacity,
+            queue_wait: WaitCounters::default(),
+            readiness_wait: WaitCounters::default(),
+            capacity_wait: WaitCounters::default(),
+            operations: AtomicOperationStats::default(),
+            storage_job_elapsed: AtomicDurationStats::default(),
+            detailed_observability,
         });
         let weak = Arc::downgrade(&shared);
         let reactor = ReactorTask {
@@ -236,16 +310,47 @@ impl Log {
 
     /// Returns a synchronous in-memory snapshot of root state.
     #[must_use]
-    pub fn stats(&self) -> Stats {
+    pub fn stats(&self) -> RootStats {
         self.shared.stats()
+    }
+
+    /// Returns the current low-frequency lifecycle and failure state.
+    #[must_use]
+    pub fn health(&self) -> RootHealth {
+        self.shared.health.borrow().clone()
+    }
+
+    /// Creates a non-owning asynchronous watch of future health transitions.
+    #[must_use]
+    pub fn watch_health(&self) -> HealthWatch {
+        HealthWatch {
+            receiver: self.shared.health.subscribe(),
+        }
     }
 
     /// Requests and awaits one physical maintenance pass.
     pub async fn reclaim(&self) -> Result<ReclaimReport> {
-        let (reply, response) = oneshot::channel();
-        let permit = self.shared.reserve_running().await?;
-        permit.send(Command::Reclaim { reply });
-        receive_response(&self.shared, response).await
+        let activity = OperationActivity::new(
+            &self.shared.operations.reclaim,
+            self.shared.detailed_observability,
+        );
+        let result = async {
+            let (reply, response) = oneshot::channel();
+            let permit = self.shared.reserve_running().await?;
+            permit.send(Command::Reclaim { reply });
+            receive_response(&self.shared, response).await
+        }
+        .await;
+        match result {
+            Ok(report) => {
+                activity.succeed(0, 0);
+                Ok(report)
+            }
+            Err(error) => {
+                activity.fail();
+                Err(error)
+            }
+        }
     }
 
     /// Closes operation admission and drains every already admitted command.
@@ -259,6 +364,7 @@ impl Log {
                 self.shared
                     .lifecycle
                     .store(SHUTTING_DOWN, Ordering::Release);
+                self.shared.set_health_state(RootState::ShuttingDown);
             }
             self.shared.shutdown.send_replace(true);
             self.shared.notify();
@@ -271,6 +377,7 @@ impl Log {
                 && self.shared.active_storage_jobs.load(Ordering::Acquire) == 0
             {
                 if self.shared.lifecycle.swap(CLOSED, Ordering::AcqRel) != CLOSED {
+                    self.shared.set_health_state(RootState::Closed);
                     self.shared.notify();
                 }
                 return Ok(());
@@ -279,6 +386,23 @@ impl Log {
                 message: "root reactor terminated before completing shutdown".to_string(),
             })?;
         }
+    }
+}
+
+impl HealthWatch {
+    /// Returns the latest lifecycle value without waiting.
+    #[must_use]
+    pub fn current(&self) -> RootHealth {
+        self.receiver.borrow().clone()
+    }
+
+    /// Waits for a later published lifecycle value.
+    ///
+    /// Returns `None` after the root state has been dropped and no further
+    /// transition can be published.
+    pub async fn changed(&mut self) -> Option<RootHealth> {
+        self.receiver.changed().await.ok()?;
+        Some(self.current())
     }
 }
 
@@ -308,91 +432,160 @@ impl Stream {
 
     /// Appends an ordered non-empty batch as one durability epoch.
     pub async fn append_batch(&self, mut records: Vec<Record>) -> Result<Vec<RecordId>> {
-        let encoded_bytes = encoded_epoch_bytes(&records)?;
-        if encoded_bytes > self.shared.limits.max_epoch_bytes {
-            return Err(Error::EpochTooLarge {
-                encoded_bytes,
-                max_bytes: self.shared.limits.max_epoch_bytes,
-            });
-        }
-        self.preflight_sequence(records.len())?;
-        let mut events = self.shared.events.subscribe();
-        loop {
-            let (reply, response) = oneshot::channel();
-            let permit = self.shared.reserve_running().await?;
-            permit.send(Command::Append {
-                stream_id: self.id,
-                records,
-                encoded_bytes,
-                reply,
-            });
-            match response.await {
-                Ok(AppendReply::Complete(result)) => return result,
-                Ok(AppendReply::Wait { records: returned }) => {
-                    records = returned;
-                    self.shared.wait_for_change(&mut events).await?;
+        let payload_bytes = records.iter().fold(0_u64, |total, record| {
+            total.saturating_add(u64::try_from(record.payload.len()).unwrap_or(u64::MAX))
+        });
+        let activity = OperationActivity::new(
+            &self.shared.operations.append,
+            self.shared.detailed_observability,
+        );
+        let result = async {
+            let encoded_bytes = encoded_epoch_bytes(&records)?;
+            if encoded_bytes > self.shared.limits.max_epoch_bytes {
+                return Err(Error::EpochTooLarge {
+                    encoded_bytes,
+                    max_bytes: self.shared.limits.max_epoch_bytes,
+                });
+            }
+            self.preflight_sequence(records.len())?;
+            let mut events = self.shared.events.subscribe();
+            loop {
+                let (reply, response) = oneshot::channel();
+                let permit = self.shared.reserve_running().await?;
+                permit.send(Command::Append {
+                    stream_id: self.id,
+                    records,
+                    encoded_bytes,
+                    reply,
+                });
+                match response.await {
+                    Ok(AppendReply::Complete(result)) => break result,
+                    Ok(AppendReply::Wait { records: returned }) => {
+                        records = returned;
+                        self.shared
+                            .wait_for_change(&mut events, WaitKind::Capacity)
+                            .await?;
+                    }
+                    Err(_) => break Err(self.shared.channel_error()),
                 }
-                Err(_) => return Err(self.shared.channel_error()),
+            }
+        }
+        .await;
+        match result {
+            Ok(ids) => {
+                activity.succeed(u64::try_from(ids.len()).unwrap_or(u64::MAX), payload_bytes);
+                Ok(ids)
+            }
+            Err(error) => {
+                activity.fail();
+                Err(error)
             }
         }
     }
 
     /// Waits for and returns a non-empty bounded snapshot of pending records.
     pub async fn read(&self, limits: ReadLimits) -> Result<PendingSnapshot> {
-        if limits.max_records == 0 {
-            return Err(Error::InvalidReadLimits);
-        }
-        let mut events = self.shared.events.subscribe();
-        loop {
-            self.shared.ensure_running()?;
-            if self.stats().pending_records == 0 {
-                self.shared.wait_for_change(&mut events).await?;
-                continue;
+        let activity = OperationActivity::new(
+            &self.shared.operations.read,
+            self.shared.detailed_observability,
+        );
+        let result = async {
+            if limits.max_records == 0 {
+                return Err(Error::InvalidReadLimits);
             }
-            let (reply, response) = oneshot::channel();
-            let permit = self.shared.reserve_running().await?;
-            permit.send(Command::Read {
-                stream_id: self.id,
-                limits,
-                reply,
-            });
-            match receive_response(&self.shared, response).await? {
-                Some(snapshot) => return Ok(snapshot),
-                None => self.shared.wait_for_change(&mut events).await?,
+            let mut events = self.shared.events.subscribe();
+            loop {
+                self.shared.ensure_running()?;
+                if self.stats().pending_records == 0 {
+                    self.shared
+                        .wait_for_change(&mut events, WaitKind::Readiness)
+                        .await?;
+                    continue;
+                }
+                let (reply, response) = oneshot::channel();
+                let permit = self.shared.reserve_running().await?;
+                permit.send(Command::Read {
+                    stream_id: self.id,
+                    limits,
+                    reply,
+                });
+                match receive_response(&self.shared, response).await? {
+                    Some(snapshot) => break Ok(snapshot),
+                    None => {
+                        self.shared
+                            .wait_for_change(&mut events, WaitKind::Readiness)
+                            .await?;
+                    }
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(snapshot) => {
+                let payload_bytes = snapshot.iter().fold(0_u64, |total, record| {
+                    total.saturating_add(u64::try_from(record.payload.len()).unwrap_or(u64::MAX))
+                });
+                activity.succeed(
+                    u64::try_from(snapshot.len()).unwrap_or(u64::MAX),
+                    payload_bytes,
+                );
+                Ok(snapshot)
+            }
+            Err(error) => {
+                activity.fail();
+                Err(error)
             }
         }
     }
 
     /// Durably removes an exact record subset from the shared pending set.
     pub async fn release(&self, ids: Vec<RecordId>) -> Result<()> {
-        if ids.len() > self.shared.limits.max_release_records {
-            return Err(Error::ReleaseTooLarge {
-                records: ids.len(),
-                max_records: self.shared.limits.max_release_records,
+        let released_records = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+        let activity = OperationActivity::new(
+            &self.shared.operations.release,
+            self.shared.detailed_observability,
+        );
+        let result = async {
+            if ids.len() > self.shared.limits.max_release_records {
+                return Err(Error::ReleaseTooLarge {
+                    records: ids.len(),
+                    max_records: self.shared.limits.max_release_records,
+                });
+            }
+            self.preflight_release(&ids)?;
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let count = u64::try_from(ids.len())
+                .map_err(|_| Error::invalid_config("release ID count does not fit u64"))?;
+            let encoded_bound = 72_u64
+                .checked_add(
+                    count
+                        .checked_mul(16)
+                        .ok_or_else(|| Error::invalid_config("release bound overflow"))?,
+                )
+                .ok_or_else(|| Error::invalid_config("release bound overflow"))?;
+            let (reply, response) = oneshot::channel();
+            let permit = self.shared.reserve_running().await?;
+            permit.send(Command::Release {
+                stream_id: self.id,
+                ids,
+                encoded_bound,
+                reply,
             });
+            receive_response(&self.shared, response).await
         }
-        self.preflight_release(&ids)?;
-        if ids.is_empty() {
-            return Ok(());
+        .await;
+        match result {
+            Ok(()) => {
+                activity.succeed(released_records, 0);
+                Ok(())
+            }
+            Err(error) => {
+                activity.fail();
+                Err(error)
+            }
         }
-        let count = u64::try_from(ids.len())
-            .map_err(|_| Error::invalid_config("release ID count does not fit u64"))?;
-        let encoded_bound = 72_u64
-            .checked_add(
-                count
-                    .checked_mul(16)
-                    .ok_or_else(|| Error::invalid_config("release bound overflow"))?,
-            )
-            .ok_or_else(|| Error::invalid_config("release bound overflow"))?;
-        let (reply, response) = oneshot::channel();
-        let permit = self.shared.reserve_running().await?;
-        permit.send(Command::Release {
-            stream_id: self.id,
-            ids,
-            encoded_bound,
-            reply,
-        });
-        receive_response(&self.shared, response).await
     }
 
     fn preflight_sequence(&self, records: usize) -> Result<()> {
@@ -447,21 +640,36 @@ impl fmt::Debug for Stream {
 impl Shared {
     async fn reserve_running(&self) -> Result<mpsc::Permit<'_, Command>> {
         self.ensure_running()?;
-        let waiting = AdmissionWait::new(self);
-        let permit = self
-            .sender
-            .reserve()
-            .await
-            .map_err(|_| self.channel_error())?;
-        drop(waiting);
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let waiting = WaitActivity::new(&self.queue_wait);
+                let permit = self
+                    .sender
+                    .reserve()
+                    .await
+                    .map_err(|_| self.channel_error())?;
+                drop(waiting);
+                permit
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(self.channel_error()),
+        };
         self.ensure_running()?;
         self.mark_admitted();
         Ok(permit)
     }
 
-    async fn wait_for_change(&self, events: &mut watch::Receiver<u64>) -> Result<()> {
+    async fn wait_for_change(
+        &self,
+        events: &mut watch::Receiver<u64>,
+        kind: WaitKind,
+    ) -> Result<()> {
         self.ensure_running()?;
-        let waiting = AdmissionWait::new(self);
+        let counters = match kind {
+            WaitKind::Readiness => &self.readiness_wait,
+            WaitKind::Capacity => &self.capacity_wait,
+        };
+        let waiting = WaitActivity::new(counters);
         let changed = events.changed().await;
         drop(waiting);
         if changed.is_err() {
@@ -497,22 +705,34 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn stats(&self) -> Stats {
-        let mut stats = self.read_view().stats.clone();
-        stats.queue_depth = self.queue_depth.load(Ordering::Acquire);
-        stats.admission_waiters = self.admission_waiters.load(Ordering::Acquire);
-        stats.admitted_operations = self.admitted_operations.load(Ordering::Acquire);
-        stats.total_admission_wait =
-            Duration::from_nanos(self.total_admission_wait_nanos.load(Ordering::Acquire));
-        stats.max_admission_wait =
-            Duration::from_nanos(self.max_admission_wait_nanos.load(Ordering::Acquire));
-        stats.poisoned = self.lifecycle.load(Ordering::Acquire) == POISONED;
-        stats
+    fn stats(&self) -> RootStats {
+        let (storage, commits, maintenance, recovery) = {
+            let view = self.read_view();
+            (view.storage, view.commits, view.maintenance, view.recovery)
+        };
+        RootStats {
+            detailed_timings: self.detailed_observability,
+            storage,
+            pressure: PressureStats {
+                command_queue_capacity: self.command_queue_capacity,
+                queue_depth: self.queue_depth.load(Ordering::Acquire),
+                active_storage_jobs: self.active_storage_jobs.load(Ordering::Acquire),
+                admitted_commands: self.admitted_commands.load(Ordering::Acquire),
+                storage_job_elapsed: self.storage_job_elapsed.snapshot(),
+                queue_wait: self.queue_wait.snapshot(),
+                readiness_wait: self.readiness_wait.snapshot(),
+                capacity_wait: self.capacity_wait.snapshot(),
+            },
+            operations: self.operations.snapshot(),
+            commits,
+            maintenance,
+            recovery,
+        }
     }
 
     fn mark_admitted(&self) {
         self.queue_depth.fetch_add(1, Ordering::AcqRel);
-        self.admitted_operations.fetch_add(1, Ordering::AcqRel);
+        atomic_saturating_add(&self.admitted_commands, 1);
     }
 
     fn mark_completed(&self, count: usize) {
@@ -527,31 +747,178 @@ impl Shared {
         self.events
             .send_modify(|version| *version = version.wrapping_add(1));
     }
+
+    fn set_health_state(&self, state: RootState) {
+        let _ = self.health.send_if_modified(|health| {
+            if health.state != state {
+                health.generation = health.generation.saturating_add(1);
+                health.state = state;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn poison(&self, operation: OperationKind, error: &Error) {
+        if self.lifecycle.load(Ordering::Acquire) == CLOSED {
+            return;
+        }
+        self.lifecycle.store(POISONED, Ordering::Release);
+        let failure = FailureInfo {
+            operation,
+            error_kind: error.kind(),
+            durability_outcome: match error.durability_outcome() {
+                DurabilityOutcome::Unknown => DurabilityOutcome::Unknown,
+                DurabilityOutcome::NotApplicable
+                    if matches!(
+                        operation,
+                        OperationKind::Append
+                            | OperationKind::Release
+                            | OperationKind::Reclaim
+                            | OperationKind::SegmentRollover
+                            | OperationKind::StatePublication
+                    ) || (operation == OperationKind::Reactor
+                        && self.active_storage_jobs.load(Ordering::Acquire) != 0) =>
+                {
+                    DurabilityOutcome::Unknown
+                }
+                DurabilityOutcome::NotApplicable => DurabilityOutcome::NotApplicable,
+            },
+            message: error.to_string(),
+        };
+        let _ = self.health.send_if_modified(|health| {
+            let mut changed = false;
+            if health.state != RootState::Poisoned {
+                health.generation = health.generation.saturating_add(1);
+                health.state = RootState::Poisoned;
+                changed = true;
+            }
+            if health.failure.is_none() {
+                health.failure = Some(failure.clone());
+                changed = true;
+            }
+            changed
+        });
+        self.notify();
+    }
 }
 
-impl<'a> AdmissionWait<'a> {
-    fn new(shared: &'a Shared) -> Self {
-        shared.admission_waiters.fetch_add(1, Ordering::AcqRel);
+impl AtomicDurationStats {
+    fn observe(&self, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        atomic_saturating_add(&self.observations, 1);
+        atomic_saturating_add(&self.total_nanos, nanos);
+        self.max_nanos.fetch_max(nanos, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> DurationStats {
+        DurationStats {
+            observations: self.observations.load(Ordering::Acquire),
+            total: Duration::from_nanos(self.total_nanos.load(Ordering::Acquire)),
+            max: Duration::from_nanos(self.max_nanos.load(Ordering::Acquire)),
+        }
+    }
+}
+
+impl WaitCounters {
+    fn snapshot(&self) -> WaitStats {
+        WaitStats {
+            current: self.current.load(Ordering::Acquire),
+            waits: self.waits.load(Ordering::Acquire),
+            elapsed: self.elapsed.snapshot(),
+        }
+    }
+}
+
+impl AtomicOperationCounters {
+    fn snapshot(&self) -> OperationCounters {
+        OperationCounters {
+            started: self.started.load(Ordering::Acquire),
+            succeeded: self.succeeded.load(Ordering::Acquire),
+            failed: self.failed.load(Ordering::Acquire),
+            cancelled: self.cancelled.load(Ordering::Acquire),
+            records: self.records.load(Ordering::Acquire),
+            payload_bytes: self.payload_bytes.load(Ordering::Acquire),
+            elapsed: self.elapsed.snapshot(),
+        }
+    }
+}
+
+impl AtomicOperationStats {
+    fn snapshot(&self) -> OperationStats {
+        OperationStats {
+            append: self.append.snapshot(),
+            read: self.read.snapshot(),
+            release: self.release.snapshot(),
+            reclaim: self.reclaim.snapshot(),
+        }
+    }
+}
+
+impl<'a> WaitActivity<'a> {
+    fn new(counters: &'a WaitCounters) -> Self {
+        counters.current.fetch_add(1, Ordering::AcqRel);
+        atomic_saturating_add(&counters.waits, 1);
         Self {
-            shared,
+            counters,
             started: Instant::now(),
         }
     }
 }
 
-impl Drop for AdmissionWait<'_> {
+impl Drop for WaitActivity<'_> {
     fn drop(&mut self) {
-        self.shared.admission_waiters.fetch_sub(1, Ordering::AcqRel);
-        let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let _ = self.shared.total_admission_wait_nanos.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| Some(current.saturating_add(nanos)),
-        );
-        self.shared
-            .max_admission_wait_nanos
-            .fetch_max(nanos, Ordering::AcqRel);
+        self.counters.current.fetch_sub(1, Ordering::AcqRel);
+        self.counters.elapsed.observe(self.started.elapsed());
     }
+}
+
+impl<'a> OperationActivity<'a> {
+    fn new(counters: &'a AtomicOperationCounters, detailed: bool) -> Self {
+        atomic_saturating_add(&counters.started, 1);
+        Self {
+            counters,
+            started: detailed.then(Instant::now),
+            finished: false,
+        }
+    }
+
+    fn succeed(mut self, records: u64, payload_bytes: u64) {
+        atomic_saturating_add(&self.counters.succeeded, 1);
+        atomic_saturating_add(&self.counters.records, records);
+        atomic_saturating_add(&self.counters.payload_bytes, payload_bytes);
+        self.finish_timing();
+        self.finished = true;
+    }
+
+    fn fail(mut self) {
+        atomic_saturating_add(&self.counters.failed, 1);
+        self.finish_timing();
+        self.finished = true;
+    }
+
+    fn finish_timing(&self) {
+        if let Some(started) = self.started {
+            self.counters.elapsed.observe(started.elapsed());
+        }
+    }
+}
+
+impl Drop for OperationActivity<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        atomic_saturating_add(&self.counters.cancelled, 1);
+        self.finish_timing();
+    }
+}
+
+fn atomic_saturating_add(value: &AtomicU64, amount: u64) {
+    let _ = value.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(amount))
+    });
 }
 
 impl Future for ReactorTask {
@@ -592,8 +959,14 @@ impl ReactorTermination {
         };
         if completed {
             shared.lifecycle.store(CLOSED, Ordering::Release);
+            shared.set_health_state(RootState::Closed);
         } else if shared.lifecycle.load(Ordering::Acquire) != CLOSED {
-            shared.lifecycle.store(POISONED, Ordering::Release);
+            shared.poison(
+                OperationKind::Reactor,
+                &Error::Runtime {
+                    message: "root reactor terminated before completing its lifecycle".to_string(),
+                },
+            );
         }
         shared.reactor_finished.store(true, Ordering::Release);
         shared.notify();
@@ -602,15 +975,16 @@ impl ReactorTermination {
 
 impl StorageJobActivity {
     fn new(shared: &Weak<Shared>) -> Self {
-        let armed = if let Some(shared) = shared.upgrade() {
+        let (armed, started) = if let Some(shared) = shared.upgrade() {
             shared.active_storage_jobs.fetch_add(1, Ordering::AcqRel);
-            true
+            (true, shared.detailed_observability.then(Instant::now))
         } else {
-            false
+            (false, None)
         };
         Self {
             shared: shared.clone(),
             armed,
+            started,
         }
     }
 }
@@ -623,6 +997,9 @@ impl Drop for StorageJobActivity {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
+        if let Some(started) = self.started {
+            shared.storage_job_elapsed.observe(started.elapsed());
+        }
         let previous = shared.active_storage_jobs.fetch_sub(1, Ordering::AcqRel);
         debug_assert_ne!(previous, 0);
         if previous == 1 && shared.reactor_finished.load(Ordering::Acquire) {
@@ -649,10 +1026,7 @@ async fn reactor_loop(
     let mut backlog = VecDeque::new();
     let mut maintenance_requested = false;
     let mut closing = false;
-    let mut age_timer = make_age_timer(&runtime, storage.as_ref()).unwrap_or_else(|_| {
-        mark_poisoned(&shared);
-        None
-    });
+    let mut age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
 
     loop {
         if maintenance_requested
@@ -662,21 +1036,19 @@ async fn reactor_loop(
         {
             maintenance_requested = false;
             let result = storage_job(runtime.clone(), &mut storage, &shared, |storage| {
-                storage.reclaim()
+                storage.reclaim(ReclaimKind::Automatic)
             })
             .await;
             match result {
-                Ok(_) => publish_storage(&shared, storage.as_ref()),
+                Ok(_) => publish_storage(&shared, storage.as_ref(), &[]),
                 Err(error) => {
                     if error.poisons_root() {
-                        mark_poisoned(&shared);
+                        mark_poisoned(&shared, OperationKind::Reclaim, &error);
                     }
+                    publish_storage(&shared, storage.as_ref(), &[]);
                 }
             }
-            age_timer = make_age_timer(&runtime, storage.as_ref()).unwrap_or_else(|_| {
-                mark_poisoned(&shared);
-                None
-            });
+            age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
         }
 
         let command = if let Some(command) = backlog.pop_front() {
@@ -697,14 +1069,14 @@ async fn reactor_loop(
                     () = timer.as_mut() => {
                         let result = storage_job(runtime.clone(), &mut storage, &shared, |storage| storage.seal_expired()).await;
                         match result {
-                            Ok(_) => publish_storage(&shared, storage.as_ref()),
-                            Err(error) if error.poisons_root() => mark_poisoned(&shared),
-                            Err(_) => {}
+                            Ok(_) => publish_storage(&shared, storage.as_ref(), &[]),
+                            Err(error) if error.poisons_root() => {
+                                mark_poisoned(&shared, OperationKind::SegmentRollover, &error);
+                                publish_storage(&shared, storage.as_ref(), &[]);
+                            }
+                            Err(_) => publish_storage(&shared, storage.as_ref(), &[]),
                         }
-                        age_timer = make_age_timer(&runtime, storage.as_ref()).unwrap_or_else(|_| {
-                            mark_poisoned(&shared);
-                            None
-                        });
+                        age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
                         continue;
                     }
                 }
@@ -819,17 +1191,31 @@ async fn reactor_loop(
                         records: records.clone(),
                     })
                     .collect::<Vec<_>>();
+                let changed_streams = entries
+                    .iter()
+                    .map(|(stream_id, _, _, _)| *stream_id)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 let count = entries.len();
                 let bounded = !matches!(capacity, Capacity::Unbounded);
                 let result = storage_job(runtime.clone(), &mut storage, &shared, move |storage| {
                     Ok(execute_append_job(storage, units, bounded))
                 })
                 .await;
-                publish_storage(&shared, storage.as_ref());
-                age_timer = make_age_timer(&runtime, storage.as_ref()).unwrap_or_else(|_| {
-                    mark_poisoned(&shared);
-                    None
-                });
+                match &result {
+                    Ok(AppendJob::Failure { error, selected })
+                        if *selected != 0 && *selected <= count && error.poisons_root() =>
+                    {
+                        mark_poisoned(&shared, OperationKind::Append, error);
+                    }
+                    Err(error) if error.poisons_root() => {
+                        mark_poisoned(&shared, OperationKind::Append, error);
+                    }
+                    _ => {}
+                }
+                publish_storage(&shared, storage.as_ref(), &changed_streams);
+                age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
                 let completed = match result {
                     Ok(AppendJob::Complete { outputs, selected })
                         if selected != 0 && selected <= count && outputs.len() == selected =>
@@ -842,17 +1228,17 @@ async fn reactor_loop(
                         selected
                     }
                     Ok(AppendJob::Complete { .. }) => {
+                        let error = Error::Runtime {
+                            message: "storage returned the wrong append result count".to_string(),
+                        };
+                        mark_poisoned(&shared, OperationKind::Append, &error);
                         let mut entries = entries.into_iter();
                         if let Some((_, _, _, reply)) = entries.next() {
-                            let _ = reply.send(AppendReply::Complete(Err(Error::Runtime {
-                                message: "storage returned the wrong append result count"
-                                    .to_string(),
-                            })));
+                            let _ = reply.send(AppendReply::Complete(Err(error)));
                         }
                         for (_, _, _, reply) in entries {
                             let _ = reply.send(AppendReply::Complete(Err(Error::Poisoned)));
                         }
-                        mark_poisoned(&shared);
                         count
                     }
                     Ok(AppendJob::Capacity(CapacityCheck::Wait {
@@ -903,30 +1289,19 @@ async fn reactor_loop(
                     {
                         let deferred = entries.split_off(selected);
                         requeue_appends(&mut backlog, deferred);
-                        let poisons = error.poisons_root();
                         reply_append_error(entries, error);
-                        if poisons {
-                            mark_poisoned(&shared);
-                        }
                         selected
                     }
                     Ok(AppendJob::Failure { .. }) => {
-                        reply_append_error(
-                            entries,
-                            Error::Runtime {
-                                message: "storage returned an invalid append failure scope"
-                                    .to_string(),
-                            },
-                        );
-                        mark_poisoned(&shared);
+                        let error = Error::Runtime {
+                            message: "storage returned an invalid append failure scope".to_string(),
+                        };
+                        mark_poisoned(&shared, OperationKind::Append, &error);
+                        reply_append_error(entries, error);
                         count
                     }
                     Err(error) => {
-                        let poisons = error.poisons_root();
                         reply_append_error(entries, error);
-                        if poisons {
-                            mark_poisoned(&shared);
-                        }
                         count
                     }
                 };
@@ -942,11 +1317,14 @@ async fn reactor_loop(
                 })
                 .await;
                 let poisons = result.as_ref().err().is_some_and(Error::poisons_root);
-                publish_storage(&shared, storage.as_ref());
-                let _ = reply.send(result);
                 if poisons {
-                    mark_poisoned(&shared);
+                    mark_poisoned(
+                        &shared,
+                        OperationKind::Read,
+                        result.as_ref().expect_err("poisoning read has error"),
+                    );
                 }
+                let _ = reply.send(result);
                 mark_completed(&shared, 1);
             }
             Command::Release {
@@ -988,6 +1366,12 @@ async fn reactor_loop(
                     }
                 }
                 let count = entries.len();
+                let changed_streams = entries
+                    .iter()
+                    .map(|(stream_id, _, _, _)| *stream_id)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 let units = entries
                     .iter()
                     .map(|(stream_id, ids, _, _)| ReleaseUnit {
@@ -1000,7 +1384,14 @@ async fn reactor_loop(
                 })
                 .await;
                 let poisons = result.as_ref().err().is_some_and(Error::poisons_root);
-                publish_storage(&shared, storage.as_ref());
+                if poisons {
+                    mark_poisoned(
+                        &shared,
+                        OperationKind::Release,
+                        result.as_ref().expect_err("poisoning release has error"),
+                    );
+                }
+                publish_storage(&shared, storage.as_ref(), &changed_streams);
                 match result {
                     Ok(()) => {
                         for (_, _, _, reply) in entries {
@@ -1019,29 +1410,27 @@ async fn reactor_loop(
                         for ((_, _, _, reply), copy) in entries.zip(copies) {
                             let _ = reply.send(Err(copy));
                         }
-                        if poisons {
-                            mark_poisoned(&shared);
-                        }
                     }
                 }
                 mark_completed(&shared, count);
             }
             Command::Reclaim { reply } => {
                 let result = storage_job(runtime.clone(), &mut storage, &shared, |storage| {
-                    storage.reclaim()
+                    storage.reclaim(ReclaimKind::Explicit)
                 })
                 .await;
                 let poisons = result.as_ref().err().is_some_and(Error::poisons_root);
-                publish_storage(&shared, storage.as_ref());
-                let _ = reply.send(result);
                 if poisons {
-                    mark_poisoned(&shared);
+                    mark_poisoned(
+                        &shared,
+                        OperationKind::Reclaim,
+                        result.as_ref().expect_err("poisoning reclaim has error"),
+                    );
                 }
+                publish_storage(&shared, storage.as_ref(), &[]);
+                let _ = reply.send(result);
                 mark_completed(&shared, 1);
-                age_timer = make_age_timer(&runtime, storage.as_ref()).unwrap_or_else(|_| {
-                    mark_poisoned(&shared);
-                    None
-                });
+                age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
             }
         }
     }
@@ -1074,7 +1463,7 @@ fn execute_append_job(
         let mut physical_limit = physical_limit;
         let mut selected = largest_admissible_append_prefix(storage, &units[..physical_limit])?;
         if matches!(selected.1, CapacityCheck::Wait { .. }) {
-            storage.reclaim()?;
+            storage.reclaim(ReclaimKind::Automatic)?;
             physical_limit = storage.append_prefix_for_active_segment(&units)?;
             selected = largest_admissible_append_prefix(storage, &units[..physical_limit])?;
         }
@@ -1175,29 +1564,69 @@ fn view_from_storage(storage: &Storage) -> Result<View> {
         .map(|stream_id| (*stream_id, storage.stream_stats(*stream_id)))
         .collect();
     Ok(View {
-        stats: storage.stats()?,
+        storage: storage.storage_stats()?,
+        commits: storage.commit_stats(),
+        maintenance: storage.maintenance_stats(),
+        recovery: storage.recovery_stats(),
         known_streams,
         stream_stats,
         highwaters: storage.stream_highwaters(),
     })
 }
 
-fn publish_storage(shared: &Weak<Shared>, storage: Option<&Storage>) {
+fn publish_storage(shared: &Weak<Shared>, storage: Option<&Storage>, streams: &[StreamId]) {
     let (Some(shared), Some(storage)) = (shared.upgrade(), storage) else {
         return;
     };
-    match view_from_storage(storage) {
-        Ok(view) => {
+    let commits = storage.commit_stats();
+    let maintenance = storage.maintenance_stats();
+    let recovery = storage.recovery_stats();
+    let storage_stats = match storage.storage_stats() {
+        Ok(stats) => stats,
+        Err(error) => {
             let mut current = shared
                 .view
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *current != view {
-                *current = view;
-                shared.notify();
+            current.commits = commits;
+            current.maintenance = maintenance;
+            current.recovery = recovery;
+            drop(current);
+            mark_poisoned(
+                &Arc::downgrade(&shared),
+                OperationKind::StatePublication,
+                &error,
+            );
+            return;
+        }
+    };
+    let mut current = shared
+        .view
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state_changed = current.storage != storage_stats;
+    current.storage = storage_stats;
+    current.commits = commits;
+    current.maintenance = maintenance;
+    current.recovery = recovery;
+    for stream_id in streams {
+        let stats = storage.stream_stats(*stream_id);
+        if stats.durable_known || current.stream_stats.contains_key(stream_id) {
+            state_changed |= current.stream_stats.get(stream_id) != Some(&stats);
+            current.stream_stats.insert(*stream_id, stats);
+        }
+        if let Some(highwater) = storage.stream_highwater(*stream_id) {
+            state_changed |= current.highwaters.get(stream_id) != Some(&highwater);
+            current.highwaters.insert(*stream_id, highwater);
+            if let Err(index) = current.known_streams.binary_search(stream_id) {
+                current.known_streams.insert(index, *stream_id);
+                state_changed = true;
             }
         }
-        Err(_) => mark_poisoned(&Arc::downgrade(&shared)),
+    }
+    drop(current);
+    if state_changed {
+        shared.notify();
     }
 }
 
@@ -1207,10 +1636,9 @@ fn lifecycle(shared: &Weak<Shared>) -> u8 {
         .map_or(CLOSED, |shared| shared.lifecycle.load(Ordering::Acquire))
 }
 
-fn mark_poisoned(shared: &Weak<Shared>) {
+fn mark_poisoned(shared: &Weak<Shared>, operation: OperationKind, error: &Error) {
     if let Some(shared) = shared.upgrade() {
-        shared.lifecycle.store(POISONED, Ordering::Release);
-        shared.notify();
+        shared.poison(operation, error);
     }
 }
 
@@ -1249,12 +1677,26 @@ fn make_age_timer(
         .map(|duration| runtime.sleep(duration)))
 }
 
+fn observed_age_timer(
+    runtime: &Arc<dyn Runtime>,
+    storage: Option<&Storage>,
+    shared: &Weak<Shared>,
+) -> Option<RuntimeFuture> {
+    match make_age_timer(runtime, storage) {
+        Ok(timer) => timer,
+        Err(error) => {
+            mark_poisoned(shared, OperationKind::SegmentRollover, &error);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::RuntimeError;
     use bytes::Bytes;
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -1262,7 +1704,42 @@ mod tests {
         reactor: Mutex<Option<RuntimeFuture>>,
     }
 
+    #[derive(Default)]
+    struct BlockingGate {
+        blocked: AtomicBool,
+        entered: AtomicBool,
+        mutex: Mutex<()>,
+        ready: Condvar,
+    }
+
+    #[derive(Default)]
+    struct GatedRuntime {
+        gate: Arc<BlockingGate>,
+    }
+
+    impl GatedRuntime {
+        fn block_storage(&self) {
+            self.gate.entered.store(false, Ordering::Release);
+            self.gate.blocked.store(true, Ordering::Release);
+        }
+
+        fn unblock_storage(&self) {
+            self.gate.blocked.store(false, Ordering::Release);
+            self.gate.ready.notify_all();
+        }
+    }
+
     impl HeldRuntime {
+        fn start_reactor(&self) {
+            let reactor = self
+                .reactor
+                .lock()
+                .unwrap()
+                .take()
+                .expect("stored reactor task");
+            drop(tokio::spawn(reactor));
+        }
+
         fn terminate_reactor(&self) {
             let reactor = self.reactor.lock().unwrap().take();
             drop(reactor);
@@ -1293,6 +1770,41 @@ mod tests {
 
         fn sleep(&self, _duration: Duration) -> RuntimeFuture {
             Box::pin(std::future::pending())
+        }
+    }
+
+    impl Runtime for GatedRuntime {
+        fn spawn(&self, future: RuntimeFuture) -> std::result::Result<(), RuntimeError> {
+            drop(tokio::spawn(future));
+            Ok(())
+        }
+
+        fn spawn_blocking(
+            &self,
+            job: Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::result::Result<(), RuntimeError> {
+            let gate = self.gate.clone();
+            let handle = std::thread::Builder::new()
+                .name("camus-test-gated-blocking".to_string())
+                .spawn(move || {
+                    if gate.blocked.load(Ordering::Acquire) {
+                        gate.entered.store(true, Ordering::Release);
+                        let guard = gate.mutex.lock().unwrap();
+                        drop(
+                            gate.ready
+                                .wait_while(guard, |_| gate.blocked.load(Ordering::Acquire))
+                                .unwrap(),
+                        );
+                    }
+                    job();
+                })
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            drop(handle);
+            Ok(())
+        }
+
+        fn sleep(&self, duration: Duration) -> RuntimeFuture {
+            Box::pin(tokio::time::sleep(duration))
         }
     }
 
@@ -1356,11 +1868,28 @@ mod tests {
         let log = Log::open(config(&directory).with_runtime(runtime.clone()))
             .await
             .unwrap();
+        let mut health_watch = log.watch_health();
         let activity = StorageJobActivity::new(&Arc::downgrade(&log.shared));
 
         runtime.terminate_reactor();
 
-        assert!(log.stats().poisoned);
+        let poisoned = tokio::time::timeout(Duration::from_secs(5), health_watch.changed())
+            .await
+            .expect("health watch did not observe reactor termination")
+            .expect("health channel closed before the poison transition");
+        assert_eq!(poisoned.state, RootState::Poisoned);
+        assert_eq!(
+            poisoned.failure.as_ref().unwrap().operation,
+            OperationKind::Reactor
+        );
+        assert_eq!(
+            poisoned.failure.as_ref().map(|failure| failure.error_kind),
+            Some(crate::ErrorKind::Runtime)
+        );
+        assert_eq!(
+            poisoned.failure.as_ref().unwrap().durability_outcome,
+            DurabilityOutcome::Unknown
+        );
         let mut shutdown = Box::pin(log.shutdown());
         tokio::select! {
             biased;
@@ -1368,14 +1897,179 @@ mod tests {
             () = tokio::task::yield_now() => {}
         }
         drop(activity);
-        tokio::time::timeout(Duration::from_secs(5), shutdown)
+        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
             .await
             .expect("shutdown did not observe reactor termination")
             .unwrap();
         assert_eq!(log.shared.lifecycle.load(Ordering::Acquire), CLOSED);
+        let closed = tokio::time::timeout(Duration::from_secs(5), health_watch.changed())
+            .await
+            .expect("health watch did not observe closure")
+            .expect("health channel closed before the closed transition");
+        assert_eq!(closed.state, RootState::Closed);
+        assert_eq!(closed.failure, poisoned.failure);
+
+        drop(shutdown);
+        drop(log);
+        assert!(health_watch.changed().await.is_none());
 
         let reopened = Log::open(config(&directory)).await.unwrap();
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_stats_report_units_combined_by_group_commit() {
+        let directory = TempDir::new().unwrap();
+        let runtime = Arc::new(HeldRuntime::default());
+        let log = Log::open(config(&directory).with_runtime(runtime.clone()))
+            .await
+            .unwrap();
+        let first_stream = log.stream(StreamId::new(27));
+        let second_stream = log.stream(StreamId::new(28));
+        let first = tokio::spawn(async move {
+            first_stream
+                .append(Record::new(Bytes::from_static(b"first")))
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_stream
+                .append(Record::new(Bytes::from_static(b"second")))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while log.stats().pressure.queue_depth != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("append commands did not enter the held reactor queue");
+
+        runtime.start_reactor();
+        let first_id = first.await.unwrap().unwrap();
+        let second_id = second.await.unwrap().unwrap();
+        let stats = log.stats();
+        assert_eq!(stats.operations.append.succeeded, 2);
+        assert_eq!(stats.commits.append_groups, 1);
+        assert_eq!(stats.commits.append_units, 2);
+        assert_eq!(stats.commits.append_records, 2);
+        assert_eq!(stats.commits.max_append_units, 2);
+
+        log.stream(StreamId::new(27))
+            .release(vec![first_id])
+            .await
+            .unwrap();
+        log.stream(StreamId::new(28))
+            .release(vec![second_id])
+            .await
+            .unwrap();
+        log.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_pressure_counts_only_reservations_that_find_a_full_queue() {
+        let directory = TempDir::new().unwrap();
+        let runtime = Arc::new(HeldRuntime::default());
+        let log = Log::open(
+            config(&directory)
+                .with_runtime(runtime.clone())
+                .with_command_queue_capacity(1),
+        )
+        .await
+        .unwrap();
+        let first_stream = log.stream(StreamId::new(29));
+        let second_stream = log.stream(StreamId::new(30));
+        let first = tokio::spawn(async move {
+            first_stream
+                .append(Record::new(Bytes::from_static(b"first")))
+                .await
+        });
+        let second = tokio::spawn(async move {
+            second_stream
+                .append(Record::new(Bytes::from_static(b"second")))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pressure = log.stats().pressure;
+                if pressure.queue_depth == 1 && pressure.queue_wait.current == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second append did not wait on the full held queue");
+
+        runtime.start_reactor();
+        let first_id = first.await.unwrap().unwrap();
+        let second_id = second.await.unwrap().unwrap();
+        let wait = log.stats().pressure.queue_wait;
+        assert_eq!(wait.current, 0);
+        assert_eq!(wait.waits, 1);
+        assert_eq!(wait.elapsed.observations, 1);
+
+        log.stream(StreamId::new(29))
+            .release(vec![first_id])
+            .await
+            .unwrap();
+        log.stream(StreamId::new(30))
+            .release(vec![second_id])
+            .await
+            .unwrap();
+        log.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_admitted_append_is_separate_from_its_durable_commit() {
+        let directory = TempDir::new().unwrap();
+        let runtime = Arc::new(GatedRuntime::default());
+        let log = Log::open(
+            config(&directory)
+                .with_runtime(runtime.clone())
+                .with_detailed_observability(),
+        )
+        .await
+        .unwrap();
+        let stream = log.stream(StreamId::new(31));
+        runtime.block_storage();
+
+        let append_stream = stream.clone();
+        let append = tokio::spawn(async move {
+            append_stream
+                .append(Record::new(Bytes::from_static(b"committed after cancel")))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime.gate.entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("append storage job did not reach the gate");
+        assert_eq!(log.stats().pressure.active_storage_jobs, 1);
+
+        append.abort();
+        assert!(append.await.unwrap_err().is_cancelled());
+        assert_eq!(log.stats().operations.append.cancelled, 1);
+        runtime.unblock_storage();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while log.stats().commits.append_groups == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled append did not finish durably");
+        let stats = log.stats();
+        assert_eq!(stats.operations.append.succeeded, 0);
+        assert_eq!(stats.operations.append.cancelled, 1);
+        assert_eq!(stats.operations.append.elapsed.observations, 1);
+        assert_eq!(stats.commits.append_groups, 1);
+        assert_eq!(stats.commits.append_records, 1);
+
+        let pending = stream.read(ReadLimits::new(1, 1024)).await.unwrap();
+        stream.release(vec![pending[0].id]).await.unwrap();
+        log.shutdown().await.unwrap();
     }
 
     #[test]

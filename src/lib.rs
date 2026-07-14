@@ -19,15 +19,17 @@ mod model;
 mod runtime;
 mod storage;
 
-pub use api::{Log, Stream};
+pub use api::{HealthWatch, Log, Stream};
 pub use config::{
     Capacity, Config, FullPolicy, DEFAULT_COMMAND_QUEUE_CAPACITY, DEFAULT_MAX_COMMIT_BYTES,
     DEFAULT_MAX_COMMIT_UNITS, DEFAULT_MAX_EPOCH_BYTES, DEFAULT_MAX_RELEASE_RECORDS,
     DEFAULT_SEGMENT_BYTES,
 };
-pub use error::{DurabilityOutcome, Error, Result};
+pub use error::{DurabilityOutcome, Error, ErrorKind, Result};
 pub use model::{
-    PendingRecord, PendingSnapshot, ReadLimits, ReclaimReport, Record, RecordId, Stats, StreamId,
-    StreamStats,
+    CommitStats, DurationStats, FailureInfo, MaintenanceStats, OperationCounters, OperationKind,
+    OperationStats, PendingRecord, PendingSnapshot, PressureStats, ReadLimits, ReclaimReport,
+    Record, RecordId, RecoveryStats, RootHealth, RootState, RootStats, StorageStats, StreamId,
+    StreamStats, WaitStats,
 };
 pub use runtime::{Runtime, RuntimeError, RuntimeFuture};

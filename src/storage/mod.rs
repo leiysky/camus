@@ -11,8 +11,8 @@ use crate::format::{
     RECORD_DESCRIPTOR_LEN, ROOT_SUPERBLOCK_LEN, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
 };
 use crate::model::{
-    PendingSnapshot, ReadLimits, ReclaimReport, Record, RecordId, RootId, Stats, StreamId,
-    StreamStats,
+    CommitStats, MaintenanceStats, PendingSnapshot, ReadLimits, ReclaimReport, Record, RecordId,
+    RecoveryStats, RootId, StorageStats, StreamId, StreamStats,
 };
 use files::{
     acquire_lock, atomic_replace, ensure_root_directory, ensure_segments_directory, file_len,
@@ -24,7 +24,7 @@ use segment::{validate_removed_segment_header, PreparedEpoch, Segment};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub(crate) struct AppendUnit {
@@ -49,6 +49,19 @@ pub(crate) enum CapacityCheck {
         needed_bytes: u64,
         total_bytes: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReclaimKind {
+    Automatic,
+    Explicit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SealReason {
+    Size,
+    Age,
+    Reclaim,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,26 +90,42 @@ pub(crate) struct Storage {
     streams: BTreeMap<StreamId, StreamState>,
     next_segment_id: u64,
     actual_file_bytes: u64,
+    durable_streams: u64,
+    pending_records: u64,
+    pending_payload_bytes: u64,
+    reclaimable_segments: u64,
+    reclaimable_bytes: u64,
+    commits: CommitStats,
+    maintenance: MaintenanceStats,
+    recovery: RecoveryStats,
 }
 
 impl Storage {
     pub(crate) fn open(config: Config) -> Result<Self> {
+        let started = Instant::now();
         config.validate()?;
         ensure_root_directory(&config.root)?;
         let lock = acquire_lock(&config.root)?;
-        initialize_or_validate_root(&config.root)?;
+        let initialized_temporaries = initialize_or_validate_root(&config.root)?;
         let root_path = config.root.join(ROOT_FILE);
         let root_bytes = read_complete_file(&root_path)?;
         let root = RootSuperblock::decode(&root_bytes)
             .map_err(|error| Error::corruption(&root_path, 0, error.to_string()))?;
         let segments_directory = ensure_segments_directory(&config.root)?;
         complete_empty_control_initialization(&config.root, root.root_id, &segments_directory)?;
-        remove_root_temporaries(&config.root)?;
+        let root_temporaries = remove_root_temporaries(&config.root)?;
 
         let control = manifest::recover(&config.root, root.root_id)?;
-        let mut storage =
-            Self::recover_segments(config, root.root_id, lock, segments_directory, control)?;
+        let mut storage = Self::recover_segments(
+            config,
+            root.root_id,
+            lock,
+            segments_directory,
+            control,
+            initialized_temporaries.saturating_add(root_temporaries),
+        )?;
         storage.actual_file_bytes = storage.calculate_actual_file_bytes()?;
+        storage.recovery.elapsed = started.elapsed();
         storage.validate_capacity()?;
         Ok(storage)
     }
@@ -107,8 +136,10 @@ impl Storage {
         lock: File,
         segments_directory: PathBuf,
         mut control: ControlRecovery,
+        removed_root_temporaries: u64,
     ) -> Result<Self> {
-        let disk_segments = enumerate_segments(&segments_directory, root_id, &control)?;
+        let (disk_segments, completed_deletions, removed_segment_temporaries) =
+            enumerate_segments(&segments_directory, root_id, &control)?;
         let mut segments = BTreeMap::new();
         let mut missing_seals = Vec::new();
         let mut active_candidates = Vec::new();
@@ -202,6 +233,28 @@ impl Storage {
             );
         }
 
+        let recovery = RecoveryStats {
+            manifest_frames_scanned: control.frames_scanned,
+            segments_scanned: u64::try_from(segments.len()).unwrap_or(u64::MAX),
+            epochs_scanned: segments.values().fold(0_u64, |total, segment| {
+                total.saturating_add(u64::try_from(segment.epochs.len()).unwrap_or(u64::MAX))
+            }),
+            records_scanned: segments.values().fold(0_u64, |total, segment| {
+                total.saturating_add(u64::try_from(segment.records.len()).unwrap_or(u64::MAX))
+            }),
+            repaired_active_tails: segments
+                .values()
+                .filter(|segment| segment.repaired_tail)
+                .count()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            repaired_manifest_tails: u64::from(control.repaired_tail),
+            completed_segment_seals: u64::try_from(missing_seals.len()).unwrap_or(u64::MAX),
+            completed_segment_deletions: completed_deletions,
+            removed_temporary_files: removed_root_temporaries
+                .saturating_add(removed_segment_temporaries),
+            elapsed: std::time::Duration::ZERO,
+        };
         let mut storage = Self {
             config,
             root_id,
@@ -213,6 +266,14 @@ impl Storage {
             streams: BTreeMap::new(),
             next_segment_id: 0,
             actual_file_bytes: 0,
+            durable_streams: 0,
+            pending_records: 0,
+            pending_payload_bytes: 0,
+            reclaimable_segments: 0,
+            reclaimable_bytes: 0,
+            commits: CommitStats::default(),
+            maintenance: MaintenanceStats::default(),
+            recovery,
         };
         storage.rebuild_indexes(
             &control.checkpoint_stream_highwaters,
@@ -226,7 +287,43 @@ impl Storage {
             storage.segments.keys().copied(),
             control.removed_segments.keys().copied(),
         )?;
+        storage.refresh_recovered_aggregates()?;
         Ok(storage)
+    }
+
+    fn refresh_recovered_aggregates(&mut self) -> Result<()> {
+        for segment in self.segments.values_mut() {
+            segment.refresh_unreleased_records()?;
+        }
+        self.durable_streams = u64::try_from(
+            self.streams
+                .values()
+                .filter(|stream| stream.highwater.is_some())
+                .count(),
+        )
+        .map_err(|_| Error::invalid_config("stream count does not fit u64"))?;
+        self.pending_records =
+            self.streams.values().try_fold(0_u64, |total, stream| {
+                total
+                    .checked_add(u64::try_from(stream.pending.len()).map_err(|_| {
+                        Error::invalid_config("pending record count does not fit u64")
+                    })?)
+                    .ok_or_else(|| Error::invalid_config("pending record count overflow"))
+            })?;
+        self.pending_payload_bytes = self.streams.values().try_fold(0_u64, |total, stream| {
+            total
+                .checked_add(stream.pending_payload_bytes)
+                .ok_or_else(|| Error::invalid_config("pending payload byte count overflow"))
+        })?;
+        self.reclaimable_segments = 0;
+        self.reclaimable_bytes = 0;
+        for segment in self.segments.values() {
+            if segment.footer.is_some() && segment.unreleased_records == 0 {
+                self.reclaimable_segments = self.reclaimable_segments.saturating_add(1);
+                self.reclaimable_bytes = self.reclaimable_bytes.saturating_add(segment.file_len);
+            }
+        }
+        Ok(())
     }
 
     fn rebuild_indexes(
@@ -497,6 +594,16 @@ impl Storage {
         if units.is_empty() {
             return Ok(Vec::new());
         }
+        let unit_count = u64::try_from(units.len())
+            .map_err(|_| Error::invalid_config("append unit count does not fit u64"))?;
+        let appended_records =
+            units.iter().try_fold(0_u64, |total, unit| {
+                total
+                    .checked_add(u64::try_from(unit.records.len()).map_err(|_| {
+                        Error::invalid_config("append record count does not fit u64")
+                    })?)
+                    .ok_or_else(|| Error::invalid_config("append record count overflow"))
+            })?;
         let mut next_sequences = self
             .streams
             .iter()
@@ -549,8 +656,10 @@ impl Storage {
             });
         }
         if let Some(active) = self.active_segment {
-            if self.active_expired()? || group_bytes > self.segment_epoch_capacity(active)? {
-                self.seal_active()?;
+            if self.active_expired()? {
+                self.seal_active(SealReason::Age)?;
+            } else if group_bytes > self.segment_epoch_capacity(active)? {
+                self.seal_active(SealReason::Size)?;
             }
         }
 
@@ -578,6 +687,16 @@ impl Storage {
             self.index_durable_records(segment_id, 0)?;
             ids
         };
+        self.commits.append_groups = self.commits.append_groups.saturating_add(1);
+        self.commits.append_units = self.commits.append_units.saturating_add(unit_count);
+        self.commits.append_records = self.commits.append_records.saturating_add(appended_records);
+        self.commits.append_encoded_bytes = self
+            .commits
+            .append_encoded_bytes
+            .saturating_add(group_bytes);
+        self.commits.max_append_units = self.commits.max_append_units.max(unit_count);
+        self.commits.max_append_encoded_bytes =
+            self.commits.max_append_encoded_bytes.max(group_bytes);
         self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         Ok(output)
     }
@@ -624,6 +743,7 @@ impl Storage {
                 )
             })?;
             let stream = self.streams.entry(record.stream_id).or_default();
+            let became_durable = stream.highwater.is_none();
             let expected = stream.highwater.map_or(0, |value| value.saturating_add(1));
             if stream.highwater == Some(u64::MAX) || record.sequence != expected {
                 return Err(Error::corruption(
@@ -648,6 +768,20 @@ impl Storage {
                         &self.segments[&segment_id].path,
                         0,
                         "pending payload bytes overflow",
+                    )
+                })?;
+            if became_durable {
+                self.durable_streams = self.durable_streams.saturating_add(1);
+            }
+            self.pending_records = self.pending_records.saturating_add(1);
+            self.pending_payload_bytes = self
+                .pending_payload_bytes
+                .checked_add(record.payload_len)
+                .ok_or_else(|| {
+                    Error::corruption(
+                        &self.segments[&segment_id].path,
+                        0,
+                        "root pending payload bytes overflow",
                     )
                 })?;
         }
@@ -715,6 +849,9 @@ impl Storage {
         let mut scheduled = BTreeSet::new();
         let mut bodies = Vec::new();
         let mut applications = Vec::new();
+        let mut release_units = 0_u64;
+        let mut release_records = 0_u64;
+        let mut release_encoded_bytes = 0_u64;
         for unit in units {
             self.validate_release(&unit)?;
             let stream = self.streams.get(&unit.stream_id);
@@ -733,6 +870,16 @@ impl Storage {
                 continue;
             }
             let ranges = coalesce_sequences(&sequences);
+            release_units = release_units.saturating_add(1);
+            release_records =
+                release_records.saturating_add(u64::try_from(sequences.len()).unwrap_or(u64::MAX));
+            let range_count = u64::try_from(ranges.len())
+                .map_err(|_| Error::invalid_config("release range count does not fit u64"))?;
+            let frame_bytes = MANIFEST_FRAME_HEADER_LEN
+                .checked_add(24)
+                .and_then(|bytes| bytes.checked_add(range_count.checked_mul(16)?))
+                .ok_or_else(|| Error::invalid_config("release frame byte count overflow"))?;
+            release_encoded_bytes = release_encoded_bytes.saturating_add(frame_bytes);
             bodies.push(ManifestBody::Release(ReleaseBody {
                 stream_id: unit.stream_id,
                 ranges,
@@ -744,6 +891,18 @@ impl Storage {
         }
         self.manifest
             .append_group(&bodies, DurabilityOutcome::Unknown)?;
+        self.commits.release_groups = self.commits.release_groups.saturating_add(1);
+        self.commits.release_units = self.commits.release_units.saturating_add(release_units);
+        self.commits.release_records = self.commits.release_records.saturating_add(release_records);
+        self.commits.release_encoded_bytes = self
+            .commits
+            .release_encoded_bytes
+            .saturating_add(release_encoded_bytes);
+        self.commits.max_release_units = self.commits.max_release_units.max(release_units);
+        self.commits.max_release_encoded_bytes = self
+            .commits
+            .max_release_encoded_bytes
+            .max(release_encoded_bytes);
         for (stream_id, sequences) in applications {
             for sequence in sequences {
                 self.mark_record_released(stream_id, sequence);
@@ -789,35 +948,48 @@ impl Storage {
         let Some(pointer) = pointer else {
             return;
         };
-        let record = &mut self
+        let segment = self
             .segments
             .get_mut(&pointer.segment_id)
-            .expect("pending segment exists")
-            .records[pointer.ordinal];
+            .expect("pending segment exists");
+        let record = &mut segment.records[pointer.ordinal];
         record.released = true;
+        let payload_len = record.payload_len;
+        let became_reclaimable = segment.footer.is_some() && segment.unreleased_records == 1;
+        segment.unreleased_records = segment
+            .unreleased_records
+            .checked_sub(1)
+            .expect("pending segment release accounting is exact");
+        let reclaimable_bytes = became_reclaimable.then_some(segment.file_len);
         let stream = self.streams.get_mut(&stream_id).expect("stream exists");
         stream.pending_payload_bytes = stream
             .pending_payload_bytes
-            .checked_sub(record.payload_len)
+            .checked_sub(payload_len)
             .expect("pending payload accounting is exact");
+        self.pending_records = self
+            .pending_records
+            .checked_sub(1)
+            .expect("root pending record accounting is exact");
+        self.pending_payload_bytes = self
+            .pending_payload_bytes
+            .checked_sub(payload_len)
+            .expect("root pending payload accounting is exact");
+        if let Some(bytes) = reclaimable_bytes {
+            self.reclaimable_segments = self.reclaimable_segments.saturating_add(1);
+            self.reclaimable_bytes = self.reclaimable_bytes.saturating_add(bytes);
+        }
     }
 
-    pub(crate) fn reclaim(&mut self) -> Result<ReclaimReport> {
+    pub(crate) fn reclaim(&mut self, kind: ReclaimKind) -> Result<ReclaimReport> {
         if let Some(active) = self.active_segment {
-            if self.segments[&active]
-                .records
-                .iter()
-                .all(|record| record.released)
-            {
-                self.seal_active()?;
+            if self.segments[&active].unreleased_records == 0 {
+                self.seal_active(SealReason::Reclaim)?;
             }
         }
         let eligible = self
             .segments
             .iter()
-            .filter(|(_, segment)| {
-                segment.footer.is_some() && segment.records.iter().all(|record| record.released)
-            })
+            .filter(|(_, segment)| segment.footer.is_some() && segment.unreleased_records == 0)
             .map(|(segment_id, _)| *segment_id)
             .collect::<Vec<_>>();
         let mut report = ReclaimReport::default();
@@ -838,6 +1010,14 @@ impl Storage {
                 .remove(&segment_id)
                 .expect("eligible segment exists");
             let bytes = segment.file_len;
+            self.reclaimable_segments = self
+                .reclaimable_segments
+                .checked_sub(1)
+                .expect("eligible segment accounting is exact");
+            self.reclaimable_bytes = self
+                .reclaimable_bytes
+                .checked_sub(bytes)
+                .expect("eligible segment byte accounting is exact");
             let path = segment.path.clone();
             drop(segment);
             fs::remove_file(&path).map_err(|error| {
@@ -851,11 +1031,25 @@ impl Storage {
             sync_directory(&self.segments_directory, DurabilityOutcome::Unknown)?;
             report.segments = report.segments.saturating_add(1);
             report.bytes = report.bytes.saturating_add(bytes);
+            self.maintenance.reclaimed_segments =
+                self.maintenance.reclaimed_segments.saturating_add(1);
+            self.maintenance.reclaimed_bytes =
+                self.maintenance.reclaimed_bytes.saturating_add(bytes);
         }
         if !report.is_empty() {
             self.compact_manifest()?;
         }
         self.actual_file_bytes = self.calculate_actual_file_bytes()?;
+        match kind {
+            ReclaimKind::Automatic => {
+                self.maintenance.automatic_reclaim_passes =
+                    self.maintenance.automatic_reclaim_passes.saturating_add(1);
+            }
+            ReclaimKind::Explicit => {
+                self.maintenance.explicit_reclaim_passes =
+                    self.maintenance.explicit_reclaim_passes.saturating_add(1);
+            }
+        }
         Ok(report)
     }
 
@@ -887,7 +1081,7 @@ impl Storage {
 
     pub(crate) fn seal_expired(&mut self) -> Result<bool> {
         if self.active_segment.is_some() && self.active_expired()? {
-            self.seal_active()?;
+            self.seal_active(SealReason::Age)?;
             if matches!(self.config.capacity, Capacity::Bounded { .. }) {
                 self.compact_manifest()?;
             }
@@ -913,7 +1107,7 @@ impl Storage {
         )))
     }
 
-    fn seal_active(&mut self) -> Result<()> {
+    fn seal_active(&mut self, reason: SealReason) -> Result<()> {
         let Some(segment_id) = self.active_segment else {
             return Ok(());
         };
@@ -931,6 +1125,24 @@ impl Storage {
             })],
             DurabilityOutcome::Unknown,
         )?;
+        if self.segments[&segment_id].unreleased_records == 0 {
+            self.reclaimable_segments = self.reclaimable_segments.saturating_add(1);
+            self.reclaimable_bytes = self
+                .reclaimable_bytes
+                .saturating_add(self.segments[&segment_id].file_len);
+        }
+        match reason {
+            SealReason::Size => {
+                self.maintenance.size_rollovers = self.maintenance.size_rollovers.saturating_add(1);
+            }
+            SealReason::Age => {
+                self.maintenance.age_rollovers = self.maintenance.age_rollovers.saturating_add(1);
+            }
+            SealReason::Reclaim => {
+                self.maintenance.reclaim_rollovers =
+                    self.maintenance.reclaim_rollovers.saturating_add(1);
+            }
+        }
         self.active_segment = None;
         Ok(())
     }
@@ -971,6 +1183,8 @@ impl Storage {
             segments,
         );
         self.manifest.compact(&checkpoint)?;
+        self.maintenance.manifest_compactions =
+            self.maintenance.manifest_compactions.saturating_add(1);
         for stream in self.streams.values_mut() {
             stream.persisted_highwater = stream.highwater;
         }
@@ -1001,27 +1215,7 @@ impl Storage {
             .collect()
     }
 
-    pub(crate) fn stats(&self) -> Result<Stats> {
-        let pending_records = self.streams.values().try_fold(0_u64, |total, stream| {
-            total
-                .checked_add(u64::try_from(stream.pending.len()).map_err(|_| {
-                    Error::corruption(
-                        &self.config.root,
-                        0,
-                        "pending record count does not fit u64",
-                    )
-                })?)
-                .ok_or_else(|| {
-                    Error::corruption(&self.config.root, 0, "pending record count overflow")
-                })
-        })?;
-        let pending_payload_bytes = self.streams.values().try_fold(0_u64, |total, stream| {
-            total
-                .checked_add(stream.pending_payload_bytes)
-                .ok_or_else(|| {
-                    Error::corruption(&self.config.root, 0, "pending payload byte count overflow")
-                })
-        })?;
+    pub(crate) fn storage_stats(&self) -> Result<StorageStats> {
         let headroom = self.maintenance_headroom_bytes()?;
         let data_admissible_bytes = match self.config.capacity {
             Capacity::Unbounded => None,
@@ -1029,7 +1223,9 @@ impl Storage {
                 Some(total_bytes.saturating_sub(self.actual_file_bytes.saturating_add(headroom)))
             }
         };
-        Ok(Stats {
+        let live_segments = u64::try_from(self.segments.len())
+            .map_err(|_| Error::invalid_config("segment count does not fit u64"))?;
+        Ok(StorageStats {
             configured_capacity_bytes: match self.config.capacity {
                 Capacity::Unbounded => None,
                 Capacity::Bounded { total_bytes, .. } => Some(total_bytes),
@@ -1038,14 +1234,35 @@ impl Storage {
                 Capacity::Unbounded => None,
                 Capacity::Bounded { when_full, .. } => Some(when_full),
             },
-            durable_streams: self.known_streams().len(),
-            pending_records,
-            pending_payload_bytes,
+            durable_streams: self.durable_streams,
+            pending_records: self.pending_records,
+            pending_payload_bytes: self.pending_payload_bytes,
             actual_file_bytes: self.actual_file_bytes,
             maintenance_headroom_bytes: headroom,
             data_admissible_bytes,
-            ..Stats::default()
+            live_segments,
+            sealed_segments: live_segments.saturating_sub(u64::from(self.active_segment.is_some())),
+            reclaimable_segments: self.reclaimable_segments,
+            reclaimable_bytes: self.reclaimable_bytes,
         })
+    }
+
+    pub(crate) const fn commit_stats(&self) -> CommitStats {
+        self.commits
+    }
+
+    pub(crate) const fn maintenance_stats(&self) -> MaintenanceStats {
+        self.maintenance
+    }
+
+    pub(crate) const fn recovery_stats(&self) -> RecoveryStats {
+        self.recovery
+    }
+
+    pub(crate) fn stream_highwater(&self, stream_id: StreamId) -> Option<u64> {
+        self.streams
+            .get(&stream_id)
+            .and_then(|stream| stream.highwater)
     }
 
     pub(crate) fn root_id(&self) -> RootId {
@@ -1363,10 +1580,10 @@ impl Storage {
     }
 }
 
-fn initialize_or_validate_root(root: &Path) -> Result<()> {
+fn initialize_or_validate_root(root: &Path) -> Result<u64> {
     let path = root.join(ROOT_FILE);
     if path.exists() {
-        return Ok(());
+        return Ok(0);
     }
     let segments = root.join(files::SEGMENTS_DIRECTORY);
     if segments.exists()
@@ -1395,7 +1612,7 @@ fn initialize_or_validate_root(root: &Path) -> Result<()> {
             "ROOT is missing while canonical manifest state exists",
         ));
     }
-    remove_root_temporaries(root)?;
+    let removed_temporaries = remove_root_temporaries(root)?;
     let root_id = RootId::random().map_err(|error| {
         Error::io(
             "generate root identity",
@@ -1409,7 +1626,8 @@ fn initialize_or_validate_root(root: &Path) -> Result<()> {
         &path,
         &RootSuperblock { root_id }.encode(),
         DurabilityOutcome::Unknown,
-    )
+    )?;
+    Ok(removed_temporaries)
 }
 
 fn complete_empty_control_initialization(
@@ -1485,8 +1703,8 @@ fn complete_empty_control_initialization(
     manifest::create_initial(root, root_id)
 }
 
-fn remove_root_temporaries(root: &Path) -> Result<()> {
-    let mut removed = false;
+fn remove_root_temporaries(root: &Path) -> Result<u64> {
+    let mut removed = 0_u64;
     for name in [
         ROOT_TEMP_FILE,
         files::CHECKPOINT_TEMP_FILE,
@@ -1502,22 +1720,23 @@ fn remove_root_temporaries(root: &Path) -> Result<()> {
                     error,
                 )
             })?;
-            removed = true;
+            removed = removed.saturating_add(1);
         }
     }
-    if removed {
+    if removed != 0 {
         sync_directory(root, DurabilityOutcome::Unknown)?;
     }
-    Ok(())
+    Ok(removed)
 }
 
 fn enumerate_segments(
     directory: &Path,
     root_id: RootId,
     control: &ControlRecovery,
-) -> Result<BTreeMap<u64, PathBuf>> {
+) -> Result<(BTreeMap<u64, PathBuf>, u64, u64)> {
     let mut segments = BTreeMap::new();
-    let mut removed_temporary = false;
+    let mut completed_deletions = 0_u64;
+    let mut removed_temporaries = 0_u64;
     for entry in fs::read_dir(directory).map_err(|error| {
         Error::io(
             "enumerate segment directory",
@@ -1545,7 +1764,7 @@ fn enumerate_segments(
                     error,
                 )
             })?;
-            removed_temporary = true;
+            removed_temporaries = removed_temporaries.saturating_add(1);
             continue;
         }
         let Some(segment_id) = parse_segment_name(&name) else {
@@ -1565,7 +1784,7 @@ fn enumerate_segments(
                     error,
                 )
             })?;
-            removed_temporary = true;
+            completed_deletions = completed_deletions.saturating_add(1);
             continue;
         }
         if segments.insert(segment_id, path.clone()).is_some() {
@@ -1576,7 +1795,7 @@ fn enumerate_segments(
             ));
         }
     }
-    if removed_temporary {
+    if completed_deletions != 0 || removed_temporaries != 0 {
         sync_directory(directory, DurabilityOutcome::Unknown)?;
     }
 
@@ -1627,7 +1846,7 @@ fn enumerate_segments(
         }
         expected = segment_id.checked_add(1);
     }
-    Ok(segments)
+    Ok((segments, completed_deletions, removed_temporaries))
 }
 
 fn derive_next_segment_id(
@@ -1723,6 +1942,8 @@ mod tests {
                 }])
                 .unwrap()
                 .remove(0);
+            assert_eq!(storage.commit_stats().append_groups, 1);
+            assert_eq!(storage.commit_stats().append_records, 1);
             let snapshot = storage
                 .read(stream_id, ReadLimits::new(8, 1024))
                 .unwrap()
@@ -1734,8 +1955,12 @@ mod tests {
                     ids: ids.clone(),
                 }])
                 .unwrap();
-            let report = storage.reclaim().unwrap();
+            assert_eq!(storage.commit_stats().release_groups, 1);
+            assert_eq!(storage.commit_stats().release_records, 1);
+            let report = storage.reclaim(ReclaimKind::Explicit).unwrap();
             assert_eq!(report.segments, 1);
+            assert_eq!(storage.maintenance_stats().explicit_reclaim_passes, 1);
+            assert_eq!(storage.maintenance_stats().reclaimed_segments, 1);
             ids
         };
 
@@ -1801,6 +2026,7 @@ mod tests {
             .set_len(length - 1)
             .unwrap();
         let repaired = Storage::open(config(&repair_root)).unwrap();
+        assert_eq!(repaired.recovery_stats().repaired_active_tails, 1);
         let snapshot = repaired
             .read(stream_id, ReadLimits::new(8, 1024))
             .unwrap()
@@ -1824,6 +2050,38 @@ mod tests {
             Storage::open(config(&corrupt_root)),
             Err(Error::Corruption { .. })
         ));
+    }
+
+    #[test]
+    fn recovery_reports_completion_of_an_unpublished_segment_seal() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(14);
+        {
+            let mut storage = Storage::open(config(&directory)).unwrap();
+            storage
+                .append_group(vec![AppendUnit {
+                    stream_id,
+                    records: vec![Record::new(Bytes::from_static(b"sealed"))],
+                }])
+                .unwrap();
+            let active = storage.active_segment.unwrap();
+            storage
+                .segments
+                .get_mut(&active)
+                .unwrap()
+                .seal_data()
+                .unwrap();
+        }
+
+        {
+            let recovered = Storage::open(config(&directory)).unwrap();
+            assert_eq!(recovered.recovery_stats().completed_segment_seals, 1);
+            assert_eq!(recovered.stream_stats(stream_id).pending_records, 1);
+        }
+
+        let stable = Storage::open(config(&directory)).unwrap();
+        assert_eq!(stable.recovery_stats().completed_segment_seals, 0);
+        assert_eq!(stable.recovery_stats().manifest_frames_scanned, 1);
     }
 
     #[test]
@@ -1886,6 +2144,7 @@ mod tests {
         drop(file);
 
         let recovered = Storage::open(config(&directory)).unwrap();
+        assert_eq!(recovered.recovery_stats().repaired_active_tails, 1);
         let snapshot = recovered
             .read(stream_id, ReadLimits::new(8, 1024))
             .unwrap()
@@ -1926,6 +2185,7 @@ mod tests {
             .set_len(length - 1)
             .unwrap();
         let repaired = Storage::open(config(&repair_root)).unwrap();
+        assert_eq!(repaired.recovery_stats().repaired_manifest_tails, 1);
         assert_eq!(repaired.stream_stats(stream_id).pending_records, 2);
 
         let corrupt_root = TempDir::new().unwrap();
@@ -1976,7 +2236,7 @@ mod tests {
                     ids: vec![id],
                 }])
                 .unwrap();
-            storage.reclaim().unwrap();
+            storage.reclaim(ReclaimKind::Explicit).unwrap();
         }
         fs::remove_file(directory.path().join(MANIFEST_LOG_FILE)).unwrap();
         assert!(matches!(

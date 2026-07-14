@@ -13,6 +13,11 @@ can change results by multiples. A trusted baseline and its candidate must be
 collected on the same controlled host, target device, build profile, and
 benchmark configuration.
 
+The Camus adapter uses default observability: base counters remain enabled,
+while optional end-to-end logical-call and storage-job timing is disabled.
+Enable detailed timing in an application only when measuring that production
+configuration deliberately.
+
 ## Directional Linux reference
 
 The following five-sample Linux/ext4 result uses the baseline profile and a

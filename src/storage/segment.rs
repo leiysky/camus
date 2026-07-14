@@ -40,8 +40,10 @@ pub(super) struct Segment {
     pub(super) header_bytes: [u8; SEGMENT_HEADER_LEN as usize],
     pub(super) file_len: u64,
     pub(super) records: Vec<StoredRecord>,
+    pub(super) unreleased_records: u64,
     pub(super) epochs: Vec<EpochBoundary>,
     pub(super) footer: Option<SegmentFooter>,
+    pub(super) repaired_tail: bool,
 }
 
 pub(super) struct PreparedEpoch {
@@ -184,6 +186,7 @@ impl Segment {
         let mut records = Vec::new();
         let mut epochs = Vec::new();
         let mut footer = None;
+        let mut repaired_tail = false;
         let mut offset = SEGMENT_HEADER_LEN;
         while offset < file_len {
             let remaining = file_len - offset;
@@ -198,6 +201,7 @@ impl Segment {
                 }
                 repair_tail(&mut file, &path, offset)?;
                 file_len = offset;
+                repaired_tail = true;
                 break;
             }
 
@@ -250,6 +254,7 @@ impl Segment {
                     }
                     repair_tail(&mut file, &path, offset)?;
                     file_len = offset;
+                    repaired_tail = true;
                     break;
                 }
             }
@@ -328,6 +333,8 @@ impl Segment {
                 error,
             )
         })?;
+        let unreleased_records = u64::try_from(records.len())
+            .map_err(|_| Error::corruption(&path, 0, "segment record count does not fit u64"))?;
         Ok(Self {
             id: expected_segment_id,
             path,
@@ -336,8 +343,10 @@ impl Segment {
             header_bytes,
             file_len,
             records,
+            unreleased_records,
             epochs,
             footer,
+            repaired_tail,
         })
     }
 
@@ -425,6 +434,9 @@ impl Segment {
         })?;
         sync_directory(directory, DurabilityOutcome::Unknown)?;
 
+        let unreleased_records = u64::try_from(records.len()).map_err(|_| {
+            Error::corruption(&canonical, 0, "segment record count does not fit u64")
+        })?;
         Ok((
             Self {
                 id: segment_id,
@@ -434,8 +446,10 @@ impl Segment {
                 header_bytes,
                 file_len: offset,
                 records,
+                unreleased_records,
                 epochs: boundaries,
                 footer: None,
+                repaired_tail: false,
             },
             ids,
         ))
@@ -479,6 +493,14 @@ impl Segment {
 
         let mut ids = Vec::with_capacity(written_epochs.len());
         for written in written_epochs {
+            self.unreleased_records = self
+                .unreleased_records
+                .checked_add(u64::try_from(written.records.len()).map_err(|_| {
+                    Error::corruption(&self.path, offset, "record count does not fit u64")
+                })?)
+                .ok_or_else(|| {
+                    Error::corruption(&self.path, offset, "unreleased record count overflow")
+                })?;
             ids.push(
                 written
                     .records
@@ -496,6 +518,17 @@ impl Segment {
         }
         self.file_len = offset;
         Ok(ids)
+    }
+
+    pub(super) fn refresh_unreleased_records(&mut self) -> Result<()> {
+        self.unreleased_records = u64::try_from(
+            self.records
+                .iter()
+                .filter(|record| !record.released)
+                .count(),
+        )
+        .map_err(|_| Error::corruption(&self.path, 0, "record count does not fit u64"))?;
+        Ok(())
     }
 
     pub(super) fn seal_data(&mut self) -> Result<SegmentFooter> {

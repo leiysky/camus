@@ -57,6 +57,7 @@ pub struct Config {
     pub(crate) max_commit_units: usize,
     pub(crate) max_commit_bytes: u64,
     pub(crate) command_queue_capacity: usize,
+    pub(crate) detailed_observability: bool,
     pub(crate) runtime: Option<Arc<dyn Runtime>>,
 }
 
@@ -74,6 +75,7 @@ impl Config {
             max_commit_units: DEFAULT_MAX_COMMIT_UNITS,
             max_commit_bytes: DEFAULT_MAX_COMMIT_BYTES,
             command_queue_capacity: DEFAULT_COMMAND_QUEUE_CAPACITY,
+            detailed_observability: false,
             runtime: None,
         }
     }
@@ -137,6 +139,25 @@ impl Config {
     #[must_use]
     pub fn with_command_queue_capacity(mut self, commands: usize) -> Self {
         self.command_queue_capacity = commands;
+        self
+    }
+
+    /// Enables monotonic-clock timing for logical calls and storage jobs.
+    ///
+    /// Current gauges, counters, wait durations, recovery duration, and health
+    /// transitions remain available when this option is disabled. The default
+    /// avoids the additional end-to-end clock reads for every logical call and
+    /// storage job. Time spent in an actual wait is always measured.
+    #[must_use]
+    pub fn with_detailed_observability(mut self) -> Self {
+        self.detailed_observability = true;
+        self
+    }
+
+    /// Disables per-operation and per-storage-job timing.
+    #[must_use]
+    pub fn without_detailed_observability(mut self) -> Self {
+        self.detailed_observability = false;
         self
     }
 
@@ -242,6 +263,7 @@ impl fmt::Debug for Config {
             .field("max_commit_units", &self.max_commit_units)
             .field("max_commit_bytes", &self.max_commit_bytes)
             .field("command_queue_capacity", &self.command_queue_capacity)
+            .field("detailed_observability", &self.detailed_observability)
             .field("custom_runtime", &self.runtime.is_some())
             .finish()
     }

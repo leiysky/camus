@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     let stats = log.stats();
     println!(
         "explicit reclaim removed {} segments / {} bytes; root now uses {} bytes",
-        report.segments, report.bytes, stats.actual_file_bytes
+        report.segments, report.bytes, stats.storage.actual_file_bytes
     );
     log.shutdown().await
 }

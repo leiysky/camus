@@ -1,4 +1,5 @@
 use crate::config::FullPolicy;
+use crate::error::{DurabilityOutcome, ErrorKind};
 use bytes::Bytes;
 use std::fmt;
 use std::ops::Deref;
@@ -255,15 +256,28 @@ impl<'a> IntoIterator for &'a PendingSnapshot {
     }
 }
 
-/// A synchronous in-memory snapshot of root-wide operational state.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Stats {
+/// A count, total, and maximum for monotonic elapsed-time observations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct DurationStats {
+    /// Number of elapsed-time observations included in this summary.
+    pub observations: u64,
+    /// Saturating sum of all observed durations.
+    pub total: Duration,
+    /// Longest observed duration.
+    pub max: Duration,
+}
+
+/// Current durable and physical aggregate state for one root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct StorageStats {
     /// Configured root capacity in bytes, or `None` for an unbounded root.
     pub configured_capacity_bytes: Option<u64>,
     /// Configured bounded-root full policy, or `None` when unbounded.
     pub full_policy: Option<FullPolicy>,
     /// Number of logical streams that have durable identity.
-    pub durable_streams: usize,
+    pub durable_streams: u64,
     /// Number of records currently pending across all streams.
     pub pending_records: u64,
     /// Sum of payload bytes currently pending across all streams.
@@ -274,18 +288,295 @@ pub struct Stats {
     pub maintenance_headroom_bytes: u64,
     /// Bytes currently admissible for data, or `None` for an unbounded root.
     pub data_admissible_bytes: Option<u64>,
-    /// Number of commands currently admitted but not complete.
+    /// Number of extant physical data segments.
+    pub live_segments: u64,
+    /// Number of live segments with a durable footer.
+    pub sealed_segments: u64,
+    /// Number of sealed segments currently eligible for reclamation.
+    pub reclaimable_segments: u64,
+    /// Exact segment bytes currently eligible for reclamation.
+    pub reclaimable_bytes: u64,
+}
+
+/// Current waiters plus saturating session totals for one wait category.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct WaitStats {
+    /// Number of operations currently waiting in this category.
+    pub current: usize,
+    /// Number of waits begun since this root was opened.
+    pub waits: u64,
+    /// Aggregate and maximum wait duration.
+    pub elapsed: DurationStats,
+}
+
+/// Reactor admission and backpressure state for one open root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PressureStats {
+    /// Configured maximum number of admitted commands buffered for this root.
+    pub command_queue_capacity: usize,
+    /// Number of commands admitted but not complete.
     pub queue_depth: usize,
-    /// Number of operations currently waiting before admission.
-    pub admission_waiters: usize,
-    /// Number of operations admitted since this root was opened.
-    pub admitted_operations: u64,
-    /// Aggregate time operations have spent waiting for admission.
-    pub total_admission_wait: Duration,
-    /// Longest observed wait before admission.
-    pub max_admission_wait: Duration,
-    /// Whether storage execution has failed closed for this open root.
-    pub poisoned: bool,
+    /// Number of filesystem jobs currently executing for this root.
+    pub active_storage_jobs: usize,
+    /// Number of commands admitted since this root was opened.
+    pub admitted_commands: u64,
+    /// Scheduling plus filesystem duration of completed storage jobs when enabled.
+    pub storage_job_elapsed: DurationStats,
+    /// Time spent waiting for a command-queue permit.
+    pub queue_wait: WaitStats,
+    /// Time waiting for a stream to become readable.
+    pub readiness_wait: WaitStats,
+    /// Time blocked appends spent waiting for capacity to change.
+    pub capacity_wait: WaitStats,
+}
+
+/// Saturating session counters for one logical public operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct OperationCounters {
+    /// Calls begun since this root was opened.
+    pub started: u64,
+    /// Calls that returned success to their caller.
+    pub succeeded: u64,
+    /// Calls that returned an error to their caller.
+    pub failed: u64,
+    /// Calls whose Future was dropped before returning an outcome.
+    pub cancelled: u64,
+    /// Records supplied to or returned by successful calls.
+    ///
+    /// For release this includes duplicate and already-released IDs. Use
+    /// `CommitStats::release_records` for the number that changed durable
+    /// pending state.
+    pub records: u64,
+    /// Payload bytes supplied to successful appends or returned by reads.
+    ///
+    /// Release and reclaim calls contribute zero.
+    pub payload_bytes: u64,
+    /// End-to-end call durations when detailed timing is enabled.
+    pub elapsed: DurationStats,
+}
+
+/// Logical-operation activity for one open root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct OperationStats {
+    /// Append and append-batch calls.
+    pub append: OperationCounters,
+    /// Waiting bounded-read calls.
+    pub read: OperationCounters,
+    /// Exact durable-release calls.
+    pub release: OperationCounters,
+    /// Explicit reclamation calls.
+    pub reclaim: OperationCounters,
+}
+
+/// Aggregate durability-group activity for one open root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CommitStats {
+    /// Successful append durability groups.
+    pub append_groups: u64,
+    /// Append API units included in successful groups.
+    pub append_units: u64,
+    /// Records included in successful append groups.
+    pub append_records: u64,
+    /// Encoded bytes included in successful append groups.
+    pub append_encoded_bytes: u64,
+    /// Largest successful append group in API units.
+    pub max_append_units: u64,
+    /// Largest successful append group in encoded bytes.
+    pub max_append_encoded_bytes: u64,
+    /// Successful release durability groups.
+    pub release_groups: u64,
+    /// Release API units that contributed a durable frame.
+    pub release_units: u64,
+    /// Unique records included in successful release groups.
+    pub release_records: u64,
+    /// Encoded manifest bytes included in successful release groups.
+    pub release_encoded_bytes: u64,
+    /// Largest successful release group in API units.
+    pub max_release_units: u64,
+    /// Largest successful release group in encoded bytes.
+    pub max_release_encoded_bytes: u64,
+}
+
+/// Successful physical maintenance activity for one open root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MaintenanceStats {
+    /// Low-priority or capacity-promoted reclamation passes.
+    pub automatic_reclaim_passes: u64,
+    /// Reclamation passes requested through `Log::reclaim`.
+    pub explicit_reclaim_passes: u64,
+    /// Segment seals caused by the configured hard size boundary.
+    pub size_rollovers: u64,
+    /// Segment seals caused by the configured soft age boundary.
+    pub age_rollovers: u64,
+    /// Fully released active segments sealed to make reclamation possible.
+    pub reclaim_rollovers: u64,
+    /// Physical segments successfully deleted and directory-synced.
+    pub reclaimed_segments: u64,
+    /// Exact segment bytes successfully deleted and directory-synced.
+    pub reclaimed_bytes: u64,
+    /// Successful complete manifest checkpoint rewrites.
+    pub manifest_compactions: u64,
+}
+
+/// Work performed while successfully opening and recovering the current root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RecoveryStats {
+    /// Complete physical manifest frames structurally scanned.
+    pub manifest_frames_scanned: u64,
+    /// Physical data segments structurally scanned.
+    pub segments_scanned: u64,
+    /// Complete append epochs structurally scanned.
+    pub epochs_scanned: u64,
+    /// Record descriptors indexed during recovery.
+    pub records_scanned: u64,
+    /// Incomplete active segment tails repaired under the format rules.
+    pub repaired_active_tails: u64,
+    /// Incomplete manifest-log tails repaired under the format rules.
+    pub repaired_manifest_tails: u64,
+    /// Complete segment footers published into the manifest during recovery.
+    pub completed_segment_seals: u64,
+    /// Durable segment deletions completed during recovery.
+    pub completed_segment_deletions: u64,
+    /// Stale root or segment temporary files removed during recovery.
+    pub removed_temporary_files: u64,
+    /// End-to-end duration of the successful storage open.
+    pub elapsed: Duration,
+}
+
+/// A synchronous in-memory snapshot of root-wide operational state.
+///
+/// Durable storage fields describe one coherent completed storage transition.
+/// Concurrent pressure and operation counters are sampled independently and
+/// may advance while the snapshot is being assembled.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RootStats {
+    /// Whether end-to-end logical-call and storage-job timing is enabled.
+    pub detailed_timings: bool,
+    /// Durable and physical aggregate state.
+    pub storage: StorageStats,
+    /// Reactor queue and wait state.
+    pub pressure: PressureStats,
+    /// Logical public-operation activity for this open session.
+    pub operations: OperationStats,
+    /// Durability-group activity for this open session.
+    pub commits: CommitStats,
+    /// Successful maintenance activity for this open session.
+    pub maintenance: MaintenanceStats,
+    /// Work performed by the successful current open.
+    pub recovery: RecoveryStats,
+}
+
+/// Lifecycle state of one open root.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum RootState {
+    /// The root accepts new operations.
+    #[default]
+    Running,
+    /// New admission is closed while admitted work drains.
+    ShuttingDown,
+    /// Storage or runtime execution failed closed and requires reopen.
+    Poisoned,
+    /// The reactor and every storage job have finished.
+    Closed,
+}
+
+impl RootState {
+    /// Returns the stable snake-case label for this lifecycle state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::ShuttingDown => "shutting_down",
+            Self::Poisoned => "poisoned",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl fmt::Display for RootState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Low-cardinality operation context for a failed-closed transition.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum OperationKind {
+    /// Append durability work.
+    Append,
+    /// Pending-record verification and read work.
+    Read,
+    /// Durable release work.
+    Release,
+    /// Automatic or explicit reclamation work.
+    Reclaim,
+    /// Reactor-driven age rollover work outside a foreground append.
+    SegmentRollover,
+    /// Publication of a completed storage state into the in-memory view.
+    StatePublication,
+    /// Root reactor or runtime progress.
+    Reactor,
+}
+
+impl OperationKind {
+    /// Returns the stable snake-case label for this operation context.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Append => "append",
+            Self::Read => "read",
+            Self::Release => "release",
+            Self::Reclaim => "reclaim",
+            Self::SegmentRollover => "segment_rollover",
+            Self::StatePublication => "state_publication",
+            Self::Reactor => "reactor",
+        }
+    }
+}
+
+impl fmt::Display for OperationKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Structured detail retained for the first failed-closed transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct FailureInfo {
+    /// Operation that encountered the root-poisoning failure.
+    pub operation: OperationKind,
+    /// Stable low-cardinality error classification.
+    pub error_kind: ErrorKind,
+    /// Whether an admitted mutation may nevertheless be durable.
+    ///
+    /// Camus reports `Unknown` conservatively when runtime failure prevents a
+    /// more precise result.
+    pub durability_outcome: DurabilityOutcome,
+    /// Human-readable detail intended for logs, never metric labels.
+    pub message: String,
+}
+
+/// Current lifecycle and first failed-closed cause for one open root.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct RootHealth {
+    /// Monotonic in-memory lifecycle generation for this open session.
+    pub generation: u64,
+    /// Current root lifecycle state.
+    pub state: RootState,
+    /// First root-poisoning failure, retained through shutdown.
+    pub failure: Option<FailureInfo>,
 }
 
 /// A synchronous in-memory snapshot of one logical stream.

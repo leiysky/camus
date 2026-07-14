@@ -69,10 +69,12 @@ publication/deletion states are repaired automatically.
 
 A bounded root preserves space for forward maintenance progress. Monitor:
 
-- `actual_file_bytes` versus configured `total_bytes`;
-- `maintenance_headroom_bytes` and `data_admissible_bytes`;
-- queue depth, admission waiters, aggregate wait time, and maximum wait;
-- pending record and payload bytes root-wide and per logical stream;
+- `storage.actual_file_bytes` versus `storage.configured_capacity_bytes`;
+- `storage.maintenance_headroom_bytes` and
+  `storage.data_admissible_bytes`;
+- `pressure.queue_depth`, queue waits, and capacity waits;
+- `storage.pending_records` and `storage.pending_payload_bytes` root-wide,
+  with intentionally selected per-stream observations when needed;
 - append/release/reclaim errors and poisoned transitions; and
 - filesystem quota/free-space alerts independently of Camus capacity.
 
@@ -85,6 +87,47 @@ roots or application admission for tenant isolation.
 Device-full and quota failures are ordinary uncertain I/O errors. Leave enough
 filesystem headroom beyond Camus's configured total for filesystem metadata,
 other processes, and operational tooling.
+
+## Observability and alerting
+
+`Log::stats` and `Log::health` read reactor-maintained memory and perform no
+filesystem I/O. Stats counters are scoped to one successful open, so an
+exporter must treat a process or root reopen as a counter reset. The durable
+storage portion is a coherent completed publication; concurrent pressure and
+logical-operation counters are independently sampled.
+
+Use a modest polling interval for stats and `Log::watch_health` for prompt
+low-frequency lifecycle changes. The health watch coalesces changes and is not
+an audit log. A poisoned transition retains the first `OperationKind`,
+`ErrorKind`, durability outcome, and message through root closure. Page or stop
+traffic on `Poisoned`; do not infer that an uncertain append or release is
+absent.
+
+Useful operational interpretations include:
+
+- sustained `pressure.capacity_wait.current` or increasing capacity wait time
+  means producers need release/reclamation progress or more root capacity;
+- sustained queue depth plus queue waits indicates reactor or storage-job
+  saturation;
+- increasing pending bytes with flat release commit counters indicates the
+  application drain is falling behind;
+- a low ratio of commit groups to commit units shows group commit is combining
+  work, while a ratio near one is normal at low concurrency;
+- reclaimable bytes that persist across completed reclamation passes deserve
+  investigation; and
+- any nonzero recovery repair or completed-lifecycle counter should be logged
+  with restart context, even though the documented repair was safe.
+
+Base gauges, counters, real wait durations, and recovery duration are always
+available. Detailed logical-call and storage-job timing is opt-in because it
+adds clock reads to every corresponding fast path. Camus provides totals and
+maxima, not histograms or an exporter.
+
+Use `Error::kind` for low-cardinality error counters at call sites. Do not use
+failure messages, filesystem paths, record IDs, or automatically enumerated
+stream IDs as metric labels. Application-selected per-stream metrics are an
+explicit cardinality decision. See [observability.md](observability.md) for
+field-by-field semantics and adapter guidance.
 
 ## Segment lifecycle and space amplification
 

@@ -69,7 +69,7 @@ impl Engine for CamusEngine {
     }
 
     async fn pending_count(&self) -> Result<u64> {
-        Ok(self.log.stats().pending_records)
+        Ok(self.log.stats().storage.pending_records)
     }
 
     async fn shutdown(&self) -> Result<()> {
