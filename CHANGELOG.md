@@ -7,6 +7,8 @@ version numbers.
 
 ## Unreleased
 
+## [1.0.0-rc.1] - 2026-07-14
+
 - Initial embedded persistent-buffer API with async `Log` and lightweight
   logical `Stream` handles.
 - Waiting, non-empty bounded `Stream::read` snapshots and exact idempotent
