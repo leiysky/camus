@@ -98,6 +98,7 @@ impl fmt::Display for ErrorKind {
 
 /// An error returned by a Camus operation.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The open configuration violates a required invariant.
     #[error("invalid configuration: {message}")]

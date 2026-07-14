@@ -15,6 +15,17 @@ pub(super) const MANIFEST_LOG_FILE: &str = "MANIFEST.log";
 pub(super) const MANIFEST_LOG_TEMP_FILE: &str = "MANIFEST.log.tmp";
 pub(super) const SEGMENTS_DIRECTORY: &str = "segments";
 
+pub(super) struct RootLock(File);
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        // A concurrently forked process can briefly inherit this open file
+        // description before exec closes it. Explicitly unlocking prevents an
+        // inherited or duplicated descriptor from extending root ownership.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 pub(super) fn ensure_root_directory(root: &Path) -> Result<()> {
     if root.exists() {
         if !root.is_dir() {
@@ -58,7 +69,7 @@ pub(super) fn ensure_root_directory(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn acquire_lock(root: &Path) -> Result<File> {
+pub(super) fn acquire_lock(root: &Path) -> Result<RootLock> {
     let path = root.join(LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -75,7 +86,7 @@ pub(super) fn acquire_lock(root: &Path) -> Result<File> {
             )
         })?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(RootLock(file)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(Error::RootInUse {
             path: root.to_path_buf(),
         }),
@@ -143,14 +154,39 @@ pub(super) fn atomic_replace(
         .write(true)
         .open(temporary)
         .map_err(|error| Error::io("create temporary file", temporary, outcome, error))?;
+    #[cfg(test)]
+    if let Some(error) =
+        crate::test_crash::injected_io_error_for_path("atomic_replace.short_write", canonical)
+    {
+        let prefix = bytes.len().div_ceil(2);
+        file.write_all(&bytes[..prefix])
+            .map_err(|error| Error::io("write temporary file", temporary, outcome, error))?;
+        return Err(Error::io("write temporary file", temporary, outcome, error));
+    }
     file.write_all(bytes)
         .map_err(|error| Error::io("write temporary file", temporary, outcome, error))?;
+    #[cfg(test)]
+    crate::test_crash::inject_io_for_path("atomic_replace.sync_data", canonical)
+        .map_err(|error| Error::io("sync temporary file", temporary, outcome, error))?;
     file.sync_data()
         .map_err(|error| Error::io("sync temporary file", temporary, outcome, error))?;
+    #[cfg(test)]
+    crate::test_crash::hit_for_path("atomic_replace.after_data_sync", canonical);
     drop(file);
+    #[cfg(test)]
+    crate::test_crash::inject_io_for_path("atomic_replace.rename", canonical)
+        .map_err(|error| Error::io("publish temporary file", canonical, outcome, error))?;
     fs::rename(temporary, canonical)
         .map_err(|error| Error::io("publish temporary file", canonical, outcome, error))?;
-    sync_directory(directory, outcome)
+    #[cfg(test)]
+    crate::test_crash::hit_for_path("atomic_replace.after_rename", canonical);
+    #[cfg(test)]
+    crate::test_crash::inject_io_for_path("atomic_replace.directory_sync", canonical)
+        .map_err(|error| Error::io("sync directory", directory, outcome, error))?;
+    sync_directory(directory, outcome)?;
+    #[cfg(test)]
+    crate::test_crash::hit_for_path("atomic_replace.after_directory_sync", canonical);
+    Ok(())
 }
 
 pub(super) fn read_complete_file(path: &Path) -> Result<Vec<u8>> {
@@ -288,5 +324,18 @@ mod tests {
             Some(42)
         );
         assert_eq!(parse_segment_name(OsStr::new("segment-42.log")), None);
+    }
+
+    #[test]
+    fn root_lock_drop_unlocks_a_duplicated_descriptor() {
+        let directory = TempDir::new().unwrap();
+        let lock = acquire_lock(directory.path()).unwrap();
+        let duplicate = lock.0.try_clone().unwrap();
+
+        drop(lock);
+        let reacquired = acquire_lock(directory.path()).unwrap();
+
+        drop(reacquired);
+        drop(duplicate);
     }
 }

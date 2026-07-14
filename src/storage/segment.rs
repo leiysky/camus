@@ -416,10 +416,30 @@ impl Segment {
                 commit: written.commit,
             });
         }
+        #[cfg(test)]
+        crate::test_crash::inject_io("segment.create.sync_data").map_err(|error| {
+            Error::io(
+                "sync temporary segment",
+                &temporary,
+                DurabilityOutcome::Unknown,
+                error,
+            )
+        })?;
         file.sync_data().map_err(|error| {
             Error::io(
                 "sync temporary segment",
                 &temporary,
+                DurabilityOutcome::Unknown,
+                error,
+            )
+        })?;
+        #[cfg(test)]
+        crate::test_crash::hit("segment.create.after_data_sync");
+        #[cfg(test)]
+        crate::test_crash::inject_io("segment.create.rename").map_err(|error| {
+            Error::io(
+                "publish data segment",
+                &canonical,
                 DurabilityOutcome::Unknown,
                 error,
             )
@@ -432,7 +452,20 @@ impl Segment {
                 error,
             )
         })?;
+        #[cfg(test)]
+        crate::test_crash::hit("segment.create.after_rename");
+        #[cfg(test)]
+        crate::test_crash::inject_io("segment.create.directory_sync").map_err(|error| {
+            Error::io(
+                "sync segment directory",
+                directory,
+                DurabilityOutcome::Unknown,
+                error,
+            )
+        })?;
         sync_directory(directory, DurabilityOutcome::Unknown)?;
+        #[cfg(test)]
+        crate::test_crash::hit("segment.create.after_directory_sync");
 
         let unreleased_records = u64::try_from(records.len()).map_err(|_| {
             Error::corruption(&canonical, 0, "segment record count does not fit u64")
@@ -482,6 +515,15 @@ impl Segment {
             offset = written.end_offset;
             written_epochs.push(written);
         }
+        #[cfg(test)]
+        crate::test_crash::inject_io("segment.append.sync_data").map_err(|error| {
+            Error::io(
+                "sync append group",
+                &self.path,
+                DurabilityOutcome::Unknown,
+                error,
+            )
+        })?;
         self.file.sync_data().map_err(|error| {
             Error::io(
                 "sync append group",
@@ -490,6 +532,8 @@ impl Segment {
                 error,
             )
         })?;
+        #[cfg(test)]
+        crate::test_crash::hit("segment.append.after_data_sync");
 
         let mut ids = Vec::with_capacity(written_epochs.len());
         for written in written_epochs {
@@ -564,9 +608,37 @@ impl Segment {
                 error,
             )
         })?;
+        #[cfg(test)]
+        if let Some(error) = crate::test_crash::injected_io_error("segment.footer.short_write") {
+            self.file
+                .write_all(&bytes[..bytes.len().div_ceil(2)])
+                .map_err(|error| {
+                    Error::io(
+                        "write segment footer",
+                        &self.path,
+                        DurabilityOutcome::Unknown,
+                        error,
+                    )
+                })?;
+            return Err(Error::io(
+                "write segment footer",
+                &self.path,
+                DurabilityOutcome::Unknown,
+                error,
+            ));
+        }
         self.file.write_all(&bytes).map_err(|error| {
             Error::io(
                 "write segment footer",
+                &self.path,
+                DurabilityOutcome::Unknown,
+                error,
+            )
+        })?;
+        #[cfg(test)]
+        crate::test_crash::inject_io("segment.seal.sync_data").map_err(|error| {
+            Error::io(
+                "sync sealed segment",
                 &self.path,
                 DurabilityOutcome::Unknown,
                 error,
@@ -580,6 +652,8 @@ impl Segment {
                 error,
             )
         })?;
+        #[cfg(test)]
+        crate::test_crash::hit("segment.seal.after_data_sync");
         self.file_len = footer.segment_bytes;
         self.footer = Some(footer);
         Ok(footer)
@@ -831,6 +905,24 @@ fn write_epoch(
     epoch: PreparedEpoch,
     _root_id: RootId,
 ) -> Result<WrittenEpoch> {
+    #[cfg(test)]
+    if let Some(error) = crate::test_crash::injected_io_error("segment.epoch.short_write") {
+        file.write_all(&epoch.header[..epoch.header.len().div_ceil(2)])
+            .map_err(|error| {
+                Error::io(
+                    "write epoch header",
+                    path,
+                    DurabilityOutcome::Unknown,
+                    error,
+                )
+            })?;
+        return Err(Error::io(
+            "write epoch header",
+            path,
+            DurabilityOutcome::Unknown,
+            error,
+        ));
+    }
     file.write_all(&epoch.header).map_err(|error| {
         Error::io(
             "write epoch header",

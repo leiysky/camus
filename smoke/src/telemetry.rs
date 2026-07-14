@@ -1392,15 +1392,32 @@ fn bucket_quantile(buckets: &[(&str, f64)], quantile: f64) -> String {
     }
 }
 
-fn resident_memory_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kilobytes = status.lines().find_map(|line| {
-        line.strip_prefix("VmRSS:")?
-            .split_ascii_whitespace()
-            .next()?
-            .parse::<u64>()
-            .ok()
-    })?;
+pub(crate) fn resident_memory_bytes() -> Option<u64> {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(kilobytes) = status.lines().find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_ascii_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        }) {
+            return kilobytes.checked_mul(1024);
+        }
+    }
+
+    let process_id = std::process::id().to_string();
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &process_id])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let kilobytes = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
     kilobytes.checked_mul(1024)
 }
 

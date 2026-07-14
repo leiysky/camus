@@ -18,6 +18,8 @@ mod format;
 mod model;
 mod runtime;
 mod storage;
+#[cfg(test)]
+mod test_crash;
 
 pub use api::{HealthWatch, Log, Stream};
 pub use config::{

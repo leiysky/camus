@@ -6,9 +6,11 @@ capacity, durability, and delivery invariants. It records a time series rather
 than reducing the run to one end-of-process number. The runner belongs to the
 standalone `smoke/` crate and is excluded from the published Camus crate.
 
-This is a manually triggered development-host test. It is not a CI gate and it
-does not compare Camus with a KV engine. The smoke crate has no RocksDB or redb
-dependency, so its build cannot resolve, download, or compile either engine.
+The long-running workload is manually triggered on a controlled development
+host and is not a CI gate. The crate's formatting, lint, unit tests, and
+dependency policy are ordinary CI checks. It does not compare Camus with a KV
+engine and has no RocksDB or redb dependency, so its build cannot resolve,
+download, or compile either engine.
 
 ## Workload and phases
 
@@ -64,6 +66,9 @@ A normal run succeeds only when all of the following hold:
 Stopping the process externally is not a successful run. The disposable data
 directory remains available for diagnosis when the runner exits with an error.
 On success it is removed unless `--keep-data` is set.
+
+The separate `backlog` qualification command intentionally kills its internal
+writer subprocess; that expected kill is not a capacity-cycle run failure.
 
 ## Metrics
 
@@ -142,6 +147,38 @@ cargo run --locked --release --manifest-path smoke/Cargo.toml -- run \
 produce the VictoriaMetrics-backed Markdown report. `--allow-no-capacity-cycle`
 exists only for diagnostic runs too short to exercise the normal pass
 criterion.
+
+## Large-backlog kill and reopen
+
+The manual `backlog` command qualifies recovery cost and correctness with a
+large pending root. Its internal writer creates deterministic records across
+all configured streams and waits after every append has reported durable
+success. The parent sends an external `SIGKILL`, opens the same root, records
+open and first-read latency, topology, recovery work, and resident memory,
+then verifies and releases every record. A final reopen must recover zero
+pending records.
+
+The default creates one million 1 KiB payloads plus framing and metadata:
+
+```sh
+cargo run --locked --release --manifest-path smoke/Cargo.toml -- backlog \
+  --records 1000000 \
+  --data-directory /path/on/device/camus-backlog-data \
+  --output-directory target/backlog-recovery-results
+```
+
+This is an unclean large-backlog reopen, not a claim that the kill landed
+inside a particular syscall. Exact storage-transition boundaries are covered
+by the deterministic library crash matrix; a release candidate still needs
+repeated externally timed kills while live append, release, rollover,
+checkpoint, and reclamation work is active.
+
+The command writes an ignored `backlog-report.json` containing revision state,
+configuration, recovered counts and bytes, segment topology, wall-clock open,
+first-read and drain durations, Camus recovery duration and scan counts, and
+RSS after open. It may contain local paths and dirty-worktree state, so keep the
+raw report outside commits and copy only a sanitized aggregate into a release
+summary.
 
 ## Output and retention
 

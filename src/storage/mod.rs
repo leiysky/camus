@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod crash_tests;
 mod files;
 mod manifest;
 mod segment;
@@ -17,12 +19,12 @@ use crate::model::{
 use files::{
     acquire_lock, atomic_replace, ensure_root_directory, ensure_segments_directory, file_len,
     parse_segment_name, parse_segment_temporary_name, read_complete_file, segment_path,
-    sync_directory, CHECKPOINT_FILE, MANIFEST_LOG_FILE, ROOT_FILE, ROOT_TEMP_FILE,
+    sync_directory, RootLock, CHECKPOINT_FILE, MANIFEST_LOG_FILE, ROOT_FILE, ROOT_TEMP_FILE,
 };
 use manifest::{checkpoint_from_state, ControlRecovery, Manifest};
 use segment::{validate_removed_segment_header, PreparedEpoch, Segment};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -82,7 +84,7 @@ pub(crate) struct Storage {
     config: Config,
     root_id: RootId,
     #[allow(dead_code)]
-    lock: File,
+    lock: RootLock,
     segments_directory: PathBuf,
     manifest: Manifest,
     segments: BTreeMap<u64, Segment>,
@@ -133,7 +135,7 @@ impl Storage {
     fn recover_segments(
         config: Config,
         root_id: RootId,
-        lock: File,
+        lock: RootLock,
         segments_directory: PathBuf,
         mut control: ControlRecovery,
         removed_root_temporaries: u64,
@@ -891,6 +893,8 @@ impl Storage {
         }
         self.manifest
             .append_group(&bodies, DurabilityOutcome::Unknown)?;
+        #[cfg(test)]
+        crate::test_crash::hit("release.after_manifest_sync");
         self.commits.release_groups = self.commits.release_groups.saturating_add(1);
         self.commits.release_units = self.commits.release_units.saturating_add(release_units);
         self.commits.release_records = self.commits.release_records.saturating_add(release_records);
@@ -999,6 +1003,8 @@ impl Storage {
                 &[ManifestBody::SegmentRemoved(body.clone())],
                 DurabilityOutcome::Unknown,
             )?;
+            #[cfg(test)]
+            crate::test_crash::hit("reclaim.after_manifest_sync");
             for highwater in &body.highwaters {
                 self.streams
                     .get_mut(&highwater.stream_id)
@@ -1020,6 +1026,15 @@ impl Storage {
                 .expect("eligible segment byte accounting is exact");
             let path = segment.path.clone();
             drop(segment);
+            #[cfg(test)]
+            crate::test_crash::inject_io("reclaim.delete").map_err(|error| {
+                Error::io(
+                    "delete reclaimed segment",
+                    &path,
+                    DurabilityOutcome::Unknown,
+                    error,
+                )
+            })?;
             fs::remove_file(&path).map_err(|error| {
                 Error::io(
                     "delete reclaimed segment",
@@ -1028,7 +1043,20 @@ impl Storage {
                     error,
                 )
             })?;
+            #[cfg(test)]
+            crate::test_crash::hit("reclaim.after_delete");
+            #[cfg(test)]
+            crate::test_crash::inject_io("reclaim.directory_sync").map_err(|error| {
+                Error::io(
+                    "sync segment directory",
+                    &self.segments_directory,
+                    DurabilityOutcome::Unknown,
+                    error,
+                )
+            })?;
             sync_directory(&self.segments_directory, DurabilityOutcome::Unknown)?;
+            #[cfg(test)]
+            crate::test_crash::hit("reclaim.after_directory_sync");
             report.segments = report.segments.saturating_add(1);
             report.bytes = report.bytes.saturating_add(bytes);
             self.maintenance.reclaimed_segments =
@@ -1125,6 +1153,8 @@ impl Storage {
             })],
             DurabilityOutcome::Unknown,
         )?;
+        #[cfg(test)]
+        crate::test_crash::hit("seal.after_manifest_sync");
         if self.segments[&segment_id].unreleased_records == 0 {
             self.reclaimable_segments = self.reclaimable_segments.saturating_add(1);
             self.reclaimable_bytes = self

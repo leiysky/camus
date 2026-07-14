@@ -169,6 +169,7 @@ impl Record {
 
 /// One owned pending record returned by a stream read.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct PendingRecord {
     /// Stable storage identity used for release.
     pub id: RecordId,
@@ -581,6 +582,7 @@ pub struct RootHealth {
 
 /// A synchronous in-memory snapshot of one logical stream.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct StreamStats {
     /// Whether the stream has ever completed a recoverable append.
     pub durable_known: bool,
@@ -592,6 +594,7 @@ pub struct StreamStats {
 
 /// Work completed by one explicit reclamation request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ReclaimReport {
     /// Number of physical segment files removed.
     pub segments: u64,

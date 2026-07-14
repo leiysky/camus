@@ -430,10 +430,28 @@ impl Manifest {
             .seek(SeekFrom::End(0))
             .map_err(|error| Error::io("seek manifest log", &self.path, outcome, error))?;
         for frame in &frames {
+            #[cfg(test)]
+            if let Some(error) = crate::test_crash::injected_io_error("manifest.frame.short_write")
+            {
+                self.file
+                    .write_all(&frame[..frame.len().div_ceil(2)])
+                    .map_err(|error| {
+                        Error::io("write manifest frame", &self.path, outcome, error)
+                    })?;
+                return Err(Error::io(
+                    "write manifest frame",
+                    &self.path,
+                    outcome,
+                    error,
+                ));
+            }
             self.file
                 .write_all(frame)
                 .map_err(|error| Error::io("write manifest frame", &self.path, outcome, error))?;
         }
+        #[cfg(test)]
+        crate::test_crash::inject_io("manifest.append.sync_data")
+            .map_err(|error| Error::io("sync manifest log", &self.path, outcome, error))?;
         self.file
             .sync_data()
             .map_err(|error| Error::io("sync manifest log", &self.path, outcome, error))?;

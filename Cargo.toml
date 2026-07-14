@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.95"
 description = "An embedded persistent buffer with at-least-once storage handoff."
 license = "Apache-2.0"
+repository = "https://github.com/leiysky/camus"
 readme = "README.md"
 documentation = "https://docs.rs/camus"
 keywords = ["persistence", "buffer", "embedded", "async", "storage"]
