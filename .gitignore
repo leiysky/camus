@@ -2,3 +2,4 @@
 /benchmarks/target/
 /fuzz/artifacts/
 /fuzz/target/
+/smoke/target/

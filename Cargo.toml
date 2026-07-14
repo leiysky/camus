@@ -9,7 +9,7 @@ readme = "README.md"
 documentation = "https://docs.rs/camus"
 keywords = ["persistence", "buffer", "embedded", "async", "storage"]
 categories = ["data-structures", "filesystem"]
-exclude = ["/.github", "/AGENTS.md", "/benchmarks", "/fuzz"]
+exclude = ["/.github", "/AGENTS.md", "/benchmarks", "/fuzz", "/smoke"]
 
 [dependencies]
 bytes = "1"
