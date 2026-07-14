@@ -22,6 +22,8 @@ pub(super) struct ControlSegment {
 }
 
 pub(super) struct ControlRecovery {
+    pub(super) frames_scanned: u64,
+    pub(super) repaired_tail: bool,
     pub(super) checkpoint_next_segment_id: u64,
     pub(super) checkpoint_stream_highwaters: BTreeMap<StreamId, u64>,
     pub(super) stream_highwaters: BTreeMap<StreamId, u64>,
@@ -165,12 +167,15 @@ pub(super) fn recover(root: &Path, root_id: RootId) -> Result<ControlRecovery> {
 
     let mut physical_seq = header.base_seq;
     let mut last_seq = checkpoint.last_applied_seq;
+    let mut frames_scanned = 0_u64;
+    let mut repaired_tail = false;
     let mut offset = MANIFEST_LOG_HEADER_LEN;
     while offset < file_len {
         let remaining = file_len - offset;
         if remaining < MANIFEST_FRAME_HEADER_LEN {
             truncate_tail(&mut file, &log_path, offset)?;
             file_len = offset;
+            repaired_tail = true;
             break;
         }
 
@@ -199,6 +204,7 @@ pub(super) fn recover(root: &Path, root_id: RootId) -> Result<ControlRecovery> {
         if frame_end > file_len {
             truncate_tail(&mut file, &log_path, offset)?;
             file_len = offset;
+            repaired_tail = true;
             break;
         }
         let body_len = usize::try_from(frame_header.body_len).map_err(|_| {
@@ -222,6 +228,7 @@ pub(super) fn recover(root: &Path, root_id: RootId) -> Result<ControlRecovery> {
         )?;
         let frame = ManifestFrame::decode(frame_header, &body)
             .map_err(|error| Error::corruption(&log_path, offset, error.to_string()))?;
+        frames_scanned = frames_scanned.saturating_add(1);
 
         if frame.manifest_seq > checkpoint.last_applied_seq {
             let expected = last_seq.checked_add(1).ok_or_else(|| {
@@ -267,6 +274,8 @@ pub(super) fn recover(root: &Path, root_id: RootId) -> Result<ControlRecovery> {
     })?;
 
     Ok(ControlRecovery {
+        frames_scanned,
+        repaired_tail,
         checkpoint_next_segment_id: checkpoint.next_segment_id,
         checkpoint_stream_highwaters,
         stream_highwaters,

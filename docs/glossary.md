@@ -90,6 +90,19 @@ The point after which dropping an operation Future abandons only its result.
 Before admission, cancellation is side-effect free; after admission the reactor
 finishes the finite storage operation.
 
+## Root statistics
+
+A synchronous fixed-size in-memory snapshot for one open session, grouped into
+storage state, reactor pressure, logical-call outcomes, commit groups,
+maintenance, and recovery. It is operational telemetry, not durable format
+state or application delivery state.
+
+## Root health
+
+The low-frequency `Running`, `ShuttingDown`, `Poisoned`, or `Closed` lifecycle
+plus the first failed-closed cause. A `HealthWatch` asynchronously observes the
+latest coalesced value without owning or backpressuring the root.
+
 ## Poisoned root
 
 An open lifecycle that failed closed after uncertain I/O, corruption, lazy body

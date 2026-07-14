@@ -1,14 +1,99 @@
 use crate::model::{RecordId, StreamId};
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// Whether an I/O error can say anything definitive about durable mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurabilityOutcome {
-    /// The operation did not attempt a durable mutation.
+    /// This value carries no mutation-specific uncertainty.
+    ///
+    /// For errors that do not encode an outcome themselves, callers must also
+    /// apply the operation's admission and cancellation contract.
     NotApplicable,
     /// Recovery must decide whether the mutation became durable.
     Unknown,
+}
+
+/// Stable low-cardinality classification for a Camus error.
+///
+/// Applications may use this value as a metric label. Paths, record IDs, and
+/// human-readable error strings should remain log or trace fields instead.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Invalid open configuration.
+    InvalidConfig,
+    /// Exclusive root ownership could not be acquired.
+    RootInUse,
+    /// Operation admission is closed.
+    Closed,
+    /// The open root has failed closed.
+    Poisoned,
+    /// Empty append request.
+    EmptyAppend,
+    /// Invalid bounded-read limits.
+    InvalidReadLimits,
+    /// Encoded append epoch exceeds its configured bound.
+    EpochTooLarge,
+    /// Release request exceeds its configured bound.
+    ReleaseTooLarge,
+    /// Earliest pending record cannot fit the read byte bound.
+    ReadLimitTooSmall,
+    /// Record ID belongs to another root or stream.
+    RecordIdScopeMismatch,
+    /// Record ID is beyond the durable stream high-water.
+    UnknownRecordId,
+    /// Stream sequence space is exhausted.
+    SequenceExhausted,
+    /// Physical segment ID space is exhausted.
+    SegmentIdExhausted,
+    /// Manifest sequence space is exhausted.
+    ManifestSequenceExhausted,
+    /// Bounded reject policy declined an append.
+    RejectedCapacity,
+    /// Append can never fit the configured root capacity.
+    ExceedsCapacity,
+    /// Filesystem operation failure.
+    Io,
+    /// Authoritative format or lifecycle corruption.
+    Corruption,
+    /// Runtime progress failure.
+    Runtime,
+}
+
+impl ErrorKind {
+    /// Returns the stable snake-case label for this classification.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "invalid_config",
+            Self::RootInUse => "root_in_use",
+            Self::Closed => "closed",
+            Self::Poisoned => "poisoned",
+            Self::EmptyAppend => "empty_append",
+            Self::InvalidReadLimits => "invalid_read_limits",
+            Self::EpochTooLarge => "epoch_too_large",
+            Self::ReleaseTooLarge => "release_too_large",
+            Self::ReadLimitTooSmall => "read_limit_too_small",
+            Self::RecordIdScopeMismatch => "record_id_scope_mismatch",
+            Self::UnknownRecordId => "unknown_record_id",
+            Self::SequenceExhausted => "sequence_exhausted",
+            Self::SegmentIdExhausted => "segment_id_exhausted",
+            Self::ManifestSequenceExhausted => "manifest_sequence_exhausted",
+            Self::RejectedCapacity => "rejected_capacity",
+            Self::ExceedsCapacity => "exceeds_capacity",
+            Self::Io => "io",
+            Self::Corruption => "corruption",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// An error returned by a Camus operation.
@@ -165,6 +250,45 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns a stable low-cardinality classification for this error.
+    #[must_use]
+    pub const fn kind(&self) -> ErrorKind {
+        match self {
+            Self::InvalidConfig { .. } => ErrorKind::InvalidConfig,
+            Self::RootInUse { .. } => ErrorKind::RootInUse,
+            Self::Closed => ErrorKind::Closed,
+            Self::Poisoned => ErrorKind::Poisoned,
+            Self::EmptyAppend => ErrorKind::EmptyAppend,
+            Self::InvalidReadLimits => ErrorKind::InvalidReadLimits,
+            Self::EpochTooLarge { .. } => ErrorKind::EpochTooLarge,
+            Self::ReleaseTooLarge { .. } => ErrorKind::ReleaseTooLarge,
+            Self::ReadLimitTooSmall { .. } => ErrorKind::ReadLimitTooSmall,
+            Self::RecordIdScopeMismatch { .. } => ErrorKind::RecordIdScopeMismatch,
+            Self::UnknownRecordId { .. } => ErrorKind::UnknownRecordId,
+            Self::SequenceExhausted { .. } => ErrorKind::SequenceExhausted,
+            Self::SegmentIdExhausted => ErrorKind::SegmentIdExhausted,
+            Self::ManifestSequenceExhausted => ErrorKind::ManifestSequenceExhausted,
+            Self::RejectedCapacity { .. } => ErrorKind::RejectedCapacity,
+            Self::ExceedsCapacity { .. } => ErrorKind::ExceedsCapacity,
+            Self::Io { .. } => ErrorKind::Io,
+            Self::Corruption { .. } => ErrorKind::Corruption,
+            Self::Runtime { .. } => ErrorKind::Runtime,
+        }
+    }
+
+    /// Returns the durability knowledge carried by this error.
+    ///
+    /// Only filesystem errors currently carry a mutation-specific outcome.
+    /// Other errors report `NotApplicable`; operation context remains
+    /// available separately through the returned error or root health.
+    #[must_use]
+    pub const fn durability_outcome(&self) -> DurabilityOutcome {
+        match self {
+            Self::Io { outcome, .. } => *outcome,
+            _ => DurabilityOutcome::NotApplicable,
+        }
+    }
+
     pub(crate) fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig {
             message: message.into(),

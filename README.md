@@ -74,16 +74,24 @@ impl Config {
 
     // Configurable execution bounds include segment bytes, optional segment
     // age, epoch bytes, release record count, commit-group count and bytes,
-    // command-queue capacity, and an optional Arc<dyn Runtime>.
+    // command-queue capacity, optional detailed timing, and an optional
+    // Arc<dyn Runtime>.
 }
 
 impl Log {
     pub async fn open(config: Config) -> Result<Self>;
     pub fn stream(&self, id: StreamId) -> Stream;
     pub fn known_streams(&self) -> Vec<StreamId>;
-    pub fn stats(&self) -> Stats;
+    pub fn stats(&self) -> RootStats;
+    pub fn health(&self) -> RootHealth;
+    pub fn watch_health(&self) -> HealthWatch;
     pub async fn reclaim(&self) -> Result<ReclaimReport>;
     pub async fn shutdown(&self) -> Result<()>;
+}
+
+impl HealthWatch {
+    pub fn current(&self) -> RootHealth;
+    pub async fn changed(&mut self) -> Option<RootHealth>;
 }
 
 impl Stream {
@@ -120,8 +128,9 @@ changing format-v1 semantics.
 
 An absent `max_segment_age` disables age rollover. `known_streams` and stats
 are concurrent in-memory snapshots; they do not imply a disk refresh. Root
-stats expose queue/admission pressure as well as capacity and maintenance
-state.
+stats separate storage, pressure, logical-operation, durability-group,
+maintenance, and recovery state. Health is a separate low-frequency lifecycle
+view.
 
 ## Example lifecycle
 
@@ -293,6 +302,27 @@ Recovery is close and reopen. The reopened root validates durable bytes and
 decides which complete operations survived. Camus has no in-place reset or
 continue-after-poison mode.
 
+## Observability boundary
+
+`Log::stats` and `Stream::stats` are synchronous, in-memory snapshots. Root
+counters are scoped to one successful open and saturate instead of wrapping.
+Base gauges, counters, real wait durations, and recovery duration are always
+available. `Config::with_detailed_observability` additionally measures
+end-to-end logical calls and storage jobs; it is disabled by default to keep
+the fast path lean.
+
+`Log::health` reports `Running`, `ShuttingDown`, `Poisoned`, or `Closed` and
+retains the first failed-closed cause. `HealthWatch::changed` provides prompt,
+coalescing async notification without owning the root or backpressuring its
+reactor. It is not a record-delivery event stream; `Stream::read` remains the
+readiness Future.
+
+Returned errors expose a stable low-cardinality `ErrorKind`. Camus does not
+choose metric names, automatically label by stream ID, or depend on a logging,
+tracing, metrics, or exporter framework. See the
+[observability guide](docs/observability.md) for counter semantics and adapter
+guidance.
+
 ## Appropriate uses and non-goals
 
 Camus fits local spools, embedded outboxes, upload staging, and durable
@@ -302,7 +332,8 @@ boundary.
 Camus intentionally does not provide:
 
 - application schemas, serialization, filtering, indexes, or mutable records;
-- callbacks, consumers, subscriptions, claims, leases, or retry scheduling;
+- record-delivery callbacks or subscriptions, consumers, claims, leases, or
+  retry scheduling;
 - per-subscriber delivery or per-stream capacity fairness;
 - exactly-once delivery, application deduplication, or distributed
   transactions;
@@ -362,10 +393,12 @@ not protect against an attacker who can rewrite bytes and recompute them.
   shutdown.
 - [Operations guide](docs/operations.md): supported deployment and failure
   response.
+- [Observability guide](docs/observability.md): snapshots, counter semantics,
+  health transitions, and adapter guidance.
 - [Benchmark guide](docs/benchmarks.md): reproducible durable-buffer workloads,
   comparison-engine mappings, and regression comparison.
 - [Runnable examples](examples/README.md): replay, waiting reads, multi-stream
-  use, and maintenance.
+  use, maintenance, and observability.
 
 ## Development
 

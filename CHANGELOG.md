@@ -20,6 +20,9 @@ version numbers.
   explicit reclaim barrier.
 - Runtime abstraction with a lazy process-wide Tokio default, cancellation-safe
   operation admission, fail-closed poisoning, and draining shutdown.
+- Pull-based root and stream snapshots, caller-versus-commit counters,
+  pressure/maintenance/recovery telemetry, stable error classifications, and a
+  non-owning async health watch; detailed fast-path timing is opt-in.
 - Checksummed format v1 with packed little-endian epochs, self-published
   segments, exact release frames, canonical checkpoints, narrow tail repair,
   ordered seal/removal publication, and immutable root identity.

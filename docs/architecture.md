@@ -92,12 +92,12 @@ facility. At most one such storage job executes for a root at a time. The
 reactor itself never occupies a blocking worker as a permanent loop. Separate
 roots may execute storage jobs concurrently.
 
-`Log::stream`, `Stream::id`, `known_streams`, and root or stream statistics
-read only reactor-maintained memory and are synchronous. They never refresh
-state from disk. Root statistics expose queue depth, admission waiters and
-latency, reservations, and capacity/maintenance state; stream statistics expose
-logical pending state. Every operation that may wait for storage, durability,
-capacity, or a timer is async.
+`Log::stream`, `Stream::id`, `known_streams`, root health, and root or stream
+statistics read only reactor-maintained memory and are synchronous. They never
+refresh state from disk. Root statistics separate durable storage state,
+reactor pressure, caller-observed operations, commit groups, maintenance, and
+recovery; stream statistics expose logical pending state. Every operation that
+may wait for storage, durability, capacity, or a timer is async.
 
 ## Admission, cancellation, and scheduling
 
@@ -270,7 +270,8 @@ closed.
 ## Waiting reads
 
 `Stream::read(limits)` is both readiness wait and bounded data read. Camus has
-no separate callback, subscription, `wait_for`, claim, or cursor API.
+no separate record-readiness callback, subscription, `wait_for`, claim, or
+cursor API.
 
 If the stream has no pending record, the Future waits outside command
 admission. Once work is visible it admits one read command. A concurrent
@@ -429,9 +430,9 @@ headroom already exceed `total_bytes`. Camus does not reserve filesystem free
 blocks. Device-full and quota errors after admission are ordinary uncertain
 I/O failures and poison the root.
 
-Statistics expose at least configured total, actual accounted bytes,
-maintenance headroom, and currently data-admissible bytes as in-memory
-snapshots.
+`RootStats::storage` exposes configured total, actual accounted bytes,
+maintenance headroom, and currently data-admissible bytes as an in-memory
+snapshot.
 
 ## Physical reclamation
 
@@ -508,6 +509,40 @@ checkpoint error, sealed-segment damage, a manifest-active segment contradicted
 by manifest state, corruption before any valid suffix, a sequence gap, root-ID
 mismatch, or a missing segment not covered by durable removal. Recovery never
 skips damaged bytes to salvage a later unit.
+
+## In-memory observability publication
+
+Observability state is scoped to one open session and is not authoritative
+file-format state. It is neither written during normal operation nor recovered
+as historical telemetry. Recovery counters describe only the work performed by
+the current successful `Log::open`.
+
+After a completed storage transition, the reactor publishes root storage,
+commit, maintenance, and recovery summaries together under one in-memory view
+lock. Only logical streams touched by that transition have their per-stream
+view updated; publishing one stream does not rebuild every known stream.
+Changes that affect only telemetry do not wake stream-readiness or
+capacity-change waiters.
+
+Queue, wait, public-operation, active-job, and optional detailed-timing fields
+use independent atomics because they also change outside the storage
+publication point. `Log::stats` therefore gives a coherent durable-storage
+portion plus concurrently sampled runtime activity, not one global
+linearization point across every field.
+
+Public-operation counters follow the caller Future. Dropping a Future records
+cancellation, even though an admitted append or release can subsequently
+complete. Commit counters follow successful live durability groups and can
+therefore advance without a caller-observed success. This distinction mirrors
+the cancellation and unknown-outcome contract rather than attempting to infer
+application delivery.
+
+Root lifecycle health is published on a separate low-frequency watch channel.
+It retains the first failed-closed operation, error classification, durability
+outcome, and human-readable detail. Receivers coalesce intermediate states and
+never backpressure or keep the root alive. The health channel is not a durable
+event log and does not carry stream readiness; `Stream::read` remains the only
+readiness-and-data Future.
 
 ## Failure and poisoned roots
 

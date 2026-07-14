@@ -8,6 +8,7 @@ cargo run --locked --example durable_replay
 cargo run --locked --example multi_stream
 cargo run --locked --example readiness
 cargo run --locked --example maintenance
+cargo run --locked --example observability
 ```
 
 | Example | Typical use | Main point |
@@ -16,6 +17,7 @@ cargo run --locked --example maintenance
 | `multi_stream` | Independent upload, audit, tenant, or destination buffers | Lightweight handles share one root while pending state and release remain stream-scoped |
 | `readiness` | Notify an async task or application reactor | Waiting `read` is the readiness Future; it observes rather than claims work |
 | `maintenance` | Capacity-aware storage maintenance | Reclamation is automatic and explicit `reclaim` is an optional maintenance barrier |
+| `observability` | Metrics/logging adapter integration | Pull structured root snapshots and await coalescing lifecycle health without callbacks or framework dependencies |
 
 The examples deliberately keep application policy outside Camus. In a real
 application:
@@ -25,8 +27,11 @@ application:
 - release only after the effect is durably represented elsewhere;
 - bound each drain attempt and coordinate workers above the storage layer;
 - coordinate multiple readers above Camus when duplicate concurrent effects
-  are undesirable; and
-- use explicit `reclaim` only when the application needs to await a pass.
+  are undesirable;
+- use explicit `reclaim` only when the application needs to await a pass; and
+- poll root stats at an application-chosen interval and reserve the health
+  watch for low-frequency lifecycle transitions.
 
 See the [usage guide](../docs/usage.md) for production ownership, retry,
-failure, and capacity patterns.
+failure, and capacity patterns, and the
+[observability guide](../docs/observability.md) for telemetry semantics.

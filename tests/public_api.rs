@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use camus::{Capacity, Config, Error, FullPolicy, Log, ReadLimits, Record, RecordId, StreamId};
+use camus::{
+    Capacity, Config, Error, ErrorKind, FullPolicy, Log, ReadLimits, Record, RecordId, RootState,
+    StreamId,
+};
 use std::time::Duration;
 
 fn config(root: &std::path::Path) -> Config {
@@ -51,6 +54,13 @@ async fn waiting_read_is_woken_by_a_durable_append() {
         waiter_stream.read(ReadLimits::new(1, 1024)).await
     });
     started_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while log.stats().pressure.readiness_wait.current == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("read did not enter the readiness wait");
 
     let id = stream
         .append(Record::new(Bytes::from_static(b"ready")))
@@ -62,6 +72,10 @@ async fn waiting_read_is_woken_by_a_durable_append() {
         .unwrap()
         .unwrap();
     assert_eq!(snapshot[0].id, id);
+    let waits = log.stats().pressure.readiness_wait;
+    assert_eq!(waits.current, 0);
+    assert_eq!(waits.waits, 1);
+    assert_eq!(waits.elapsed.observations, 1);
     stream.release(vec![id]).await.unwrap();
     log.shutdown().await.unwrap();
 }
@@ -232,7 +246,7 @@ async fn bounded_reject_and_block_preserve_existing_pending_data() {
         }
         assert!(!ids.is_empty());
         assert_eq!(stream.stats().pending_records, ids.len() as u64);
-        assert!(log.stats().actual_file_bytes <= 12 * 1024);
+        assert!(log.stats().storage.actual_file_bytes <= 12 * 1024);
         log.shutdown().await.unwrap();
     }
 
@@ -242,7 +256,7 @@ async fn bounded_reject_and_block_preserve_existing_pending_data() {
     let stream = log.stream(stream_id);
     let blocked_stream = stream.clone();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let admitted_before = log.stats().admitted_operations;
+    let admitted_before = log.stats().pressure.admitted_commands;
     let blocked = tokio::spawn(async move {
         started_tx.send(()).unwrap();
         blocked_stream
@@ -253,7 +267,9 @@ async fn bounded_reject_and_block_preserve_existing_pending_data() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let stats = log.stats();
-            if stats.admitted_operations > admitted_before && stats.admission_waiters > 0 {
+            if stats.pressure.admitted_commands > admitted_before
+                && stats.pressure.capacity_wait.current > 0
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -261,11 +277,11 @@ async fn bounded_reject_and_block_preserve_existing_pending_data() {
     })
     .await
     .expect("append did not reach the capacity wait");
-    let blocked_admissions = log.stats().admitted_operations;
+    let blocked_admissions = log.stats().pressure.admitted_commands;
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(log.stats().admitted_operations, blocked_admissions);
+    assert_eq!(log.stats().pressure.admitted_commands, blocked_admissions);
 
     stream.release(ids).await.unwrap();
     let admitted = tokio::time::timeout(Duration::from_secs(5), blocked)
@@ -301,5 +317,116 @@ async fn bounded_block_rejects_an_append_that_can_never_fit() {
     .await
     .expect("an impossible append waited under Block");
     assert!(matches!(result, Err(Error::ExceedsCapacity { .. })));
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn root_observability_separates_calls_commits_and_maintenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = Log::open(config(directory.path()).with_detailed_observability())
+        .await
+        .unwrap();
+    let stream = log.stream(StreamId::new(41));
+
+    assert_eq!(log.health().state, RootState::Running);
+    assert!(log.stats().detailed_timings);
+
+    let error = stream.read(ReadLimits::new(0, 1024)).await.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidReadLimits);
+    assert_eq!(error.kind().as_str(), "invalid_read_limits");
+
+    let ids = stream
+        .append_batch(vec![
+            Record::new(Bytes::from_static(b"first")),
+            Record::new(Bytes::from_static(b"second")),
+        ])
+        .await
+        .unwrap();
+    let snapshot = stream.read(ReadLimits::new(2, 1024)).await.unwrap();
+    assert_eq!(snapshot.len(), 2);
+    stream.release(vec![ids[0], ids[0], ids[1]]).await.unwrap();
+    log.reclaim().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while log.stats().pressure.storage_job_elapsed.observations < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed storage-job timings were not published");
+
+    let stats = log.stats();
+    assert_eq!(stats.storage.pending_records, 0);
+    assert_eq!(stats.operations.append.started, 1);
+    assert_eq!(stats.operations.append.succeeded, 1);
+    assert_eq!(stats.operations.append.records, 2);
+    assert_eq!(stats.operations.append.payload_bytes, 11);
+    assert_eq!(stats.operations.append.elapsed.observations, 1);
+    assert_eq!(stats.operations.read.started, 2);
+    assert_eq!(stats.operations.read.succeeded, 1);
+    assert_eq!(stats.operations.read.failed, 1);
+    assert_eq!(stats.operations.read.records, 2);
+    assert_eq!(stats.operations.read.elapsed.observations, 2);
+    assert_eq!(stats.operations.release.succeeded, 1);
+    assert_eq!(stats.operations.release.records, 3);
+    assert_eq!(stats.operations.release.elapsed.observations, 1);
+    assert_eq!(stats.operations.reclaim.succeeded, 1);
+    assert_eq!(stats.operations.reclaim.elapsed.observations, 1);
+
+    assert_eq!(stats.commits.append_groups, 1);
+    assert_eq!(stats.commits.append_units, 1);
+    assert_eq!(stats.commits.append_records, 2);
+    assert_eq!(stats.commits.release_groups, 1);
+    assert_eq!(stats.commits.release_units, 1);
+    assert_eq!(stats.commits.release_records, 2);
+    assert!(stats.pressure.storage_job_elapsed.observations >= 4);
+    assert_eq!(stats.maintenance.explicit_reclaim_passes, 1);
+    assert_eq!(stats.maintenance.reclaimed_segments, 1);
+    assert_eq!(stats.pressure.queue_wait.waits, 0);
+    assert_eq!(log.health().state, RootState::Running);
+
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn default_observability_counts_without_detailed_call_timing() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = Log::open(config(directory.path())).await.unwrap();
+    log.stream(StreamId::new(43))
+        .append(Record::new(Bytes::from_static(b"payload")))
+        .await
+        .unwrap();
+
+    let stats = log.stats();
+    assert!(!stats.detailed_timings);
+    assert_eq!(stats.operations.append.succeeded, 1);
+    assert_eq!(stats.operations.append.elapsed.observations, 0);
+    assert_eq!(stats.commits.append_groups, 1);
+    assert_eq!(stats.pressure.storage_job_elapsed.observations, 0);
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_waiting_read_is_reported_as_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = Log::open(config(directory.path()).with_detailed_observability())
+        .await
+        .unwrap();
+    let stream = log.stream(StreamId::new(47));
+    let mut waiting = Box::pin(stream.read(ReadLimits::new(1, 1024)));
+
+    tokio::select! {
+        biased;
+        result = &mut waiting => panic!("empty stream read completed unexpectedly: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(log.stats().pressure.readiness_wait.current, 1);
+    drop(waiting);
+
+    let stats = log.stats();
+    assert_eq!(stats.pressure.readiness_wait.current, 0);
+    assert_eq!(stats.pressure.readiness_wait.waits, 1);
+    assert_eq!(stats.operations.read.started, 1);
+    assert_eq!(stats.operations.read.cancelled, 1);
+    assert_eq!(stats.operations.read.elapsed.observations, 1);
     log.shutdown().await.unwrap();
 }

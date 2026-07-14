@@ -10,7 +10,7 @@ append -> waiting bounded read -> durable external effect -> release -> reclaim
 An append that reports success remains recoverable until release is durable.
 If the process stops after an external effect but before release, the same
 record is returned again. Camus deliberately does not create consumers,
-callbacks, claims, retries, or exactly-once effects.
+record-delivery callbacks, claims, retries, or exactly-once effects.
 
 The public boundary is defined in [README.md](../README.md). On-disk ordering
 and format details are in [architecture.md](architecture.md) and
@@ -26,7 +26,8 @@ and format details are in [architecture.md](architecture.md) and
 | Wait for pending work and read it | `stream.read(ReadLimits).await` |
 | Durably remove an exact subset | `stream.release(ids).await` |
 | Await one maintenance pass | `log.reclaim().await` |
-| Observe current in-memory state | `stats`, `known_streams`, `id` |
+| Observe current in-memory state | `stats`, `health`, `known_streams`, `id` |
+| Await a root lifecycle transition | `log.watch_health().changed().await` |
 | Drain and close the root | `log.shutdown().await` |
 
 Potential filesystem work is async. Handle construction and reactor-maintained
@@ -177,6 +178,34 @@ other streams in the same segment. `Log::reclaim` is an optional barrier for a
 maintenance pass, so it may return an empty report when automatic work already
 won the race.
 
+## Observe a running root
+
+`Log::stats` returns a fixed-size in-memory `RootStats` snapshot grouped into
+storage, pressure, logical operations, commit groups, maintenance, and
+recovery. `Stream::stats` returns pending state for one selected logical
+stream. Neither call performs disk I/O.
+
+Base counters and actual wait durations are always collected. Enable optional
+end-to-end logical-call and storage-job timing at open when its extra clock
+reads are useful:
+
+```rust,no_run
+# use camus::{Capacity, Config};
+# let root = std::path::Path::new("camus-data");
+let config = Config::new(root, Capacity::Unbounded)
+    .with_detailed_observability();
+```
+
+`Log::health` is the current root lifecycle. `Log::watch_health` creates a
+non-owning, coalescing async watch for prompt transitions such as `Poisoned` or
+`Closed`. It is intentionally separate from stream readiness: await
+`Stream::read` to know when a stream has pending data.
+
+Classify returned errors with `Error::kind`. The low-cardinality `ErrorKind`
+may be a metric label; paths, messages, record IDs, and stream IDs should not
+be automatic labels. See [the observability guide](observability.md) for exact
+counter, timing, cancellation, and health semantics.
+
 ## Cancellation, errors, and shutdown
 
 Dropping an operation Future before command admission is side-effect free.
@@ -199,4 +228,4 @@ the reactor continues the already-started shutdown. Dropping the final `Log` or
 an immediate reopen may briefly receive `RootInUse`.
 
 See [the runnable examples](../examples/README.md) for replay, waiting reads,
-multi-stream use, and capacity-aware maintenance.
+multi-stream use, capacity-aware maintenance, and observability.
