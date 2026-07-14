@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Documentation tests
+        run: cargo test --locked --doc
+      - name: Documentation build
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+      - name: Release-mode tests
+        run: cargo test --locked --release --lib --tests
+      - name: Check fuzz targets
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml
+      - name: Package verification
+        run: cargo package --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Unit and integration tests
+        run: cargo test --locked --lib --tests
+
+  current-stable:
+    name: Test (current stable)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Current stable toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Unit and integration tests
+        run: cargo +stable test --locked --lib --tests

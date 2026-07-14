@@ -1,0 +1,2 @@
+# Fuzz corpora are arbitrary byte sequences, not source text.
+fuzz/corpus/** binary

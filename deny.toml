@@ -1,0 +1,16 @@
+[licenses]
+allow = [
+  "Apache-2.0",
+  "BSL-1.0",
+  "MIT",
+  "NCSA",
+  "Unicode-3.0",
+  "Unlicense",
+]
+confidence-threshold = 0.8
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

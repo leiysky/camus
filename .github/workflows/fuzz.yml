@@ -1,0 +1,26 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly-2026-04-02 --profile minimal
+      - name: cargo-fuzz
+        run: cargo +nightly-2026-04-02 install cargo-fuzz --locked --version 0.13.2
+      - name: Segment recovery fuzzing
+        run: cargo +nightly-2026-04-02 fuzz run wal_recovery -- -max_total_time=60 -timeout=5
+      - name: Manifest recovery fuzzing
+        run: cargo +nightly-2026-04-02 fuzz run manifest_recovery -- -max_total_time=60 -timeout=5

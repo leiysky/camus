@@ -1,0 +1,23 @@
+[package]
+name = "camus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "An embedded durable staging log for at-least-once pipelines."
+license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/camus"
+keywords = ["wal", "durability", "embedded", "outbox", "storage"]
+categories = ["data-structures", "filesystem"]
+exclude = ["/.github", "/AGENTS.md", "/fuzz"]
+
+[dependencies]
+bytes = "1"
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "3.10"
