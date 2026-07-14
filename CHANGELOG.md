@@ -49,3 +49,6 @@ version numbers.
 - Forward-extensible public errors and snapshot/report structs, plus an
   explicit Linux production support boundary and macOS development-only
   status for 1.0 qualification.
+- Manual, non-publishing release qualification with explicit first-candidate
+  or published SemVer baseline policy, packaged-source tests, and a registry
+  publication dry run.

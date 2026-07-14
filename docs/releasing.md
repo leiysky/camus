@@ -20,6 +20,27 @@ Before publishing a release candidate or stable version, the repository must:
 If the repository host cannot enforce these controls for a private project,
 make the repository public or move it to a plan that can before declaring 1.0.
 
+## Manual release qualification
+
+The `Release qualification` GitHub Actions workflow is manual-only and never
+publishes, tags, or creates a release. Dispatch it at the exact reviewed
+candidate commit with:
+
+- `expected_version` equal to `Cargo.toml` and a dated
+  `## [<version>] - YYYY-MM-DD` heading in `CHANGELOG.md`;
+- `establish_api_baseline` enabled only for the first public candidate; or
+- `baseline_version` set to the previous published candidate or stable crate
+  for every later release.
+
+The baseline choices are mutually exclusive, and omitting both fails the run.
+The workflow executes the complete locked repository checks, applies a fixed
+`patch` compatibility policy with `cargo-semver-checks` when a published
+baseline exists, builds the crate archive, runs the library and integration
+tests from Cargo's extracted package source, and performs a publication dry
+run. This policy freezes the public API throughout the `1.0.0-rc.N` chain and
+the transition to `1.0.0`. A successful run is repository qualification
+evidence; it does not replace the external reliability gates below.
+
 ## Compatibility gates
 
 Every candidate must pass all of the following:
@@ -30,8 +51,9 @@ Every candidate must pass all of the following:
    roots with it and open them with the new candidate. The first candidate
    establishes this writer baseline.
 3. Run `cargo semver-checks` against the previous candidate or stable release.
-   The first candidate establishes the reviewed API baseline; later candidates
-   review every reported break before changing a major version.
+   The first candidate establishes the reviewed API baseline; later 1.0
+   candidates must pass with patch compatibility and cannot waive a public API
+   break by weakening the release type.
 4. Review public enums, public-field structs, traits, serialized identities,
    default values, errors, cancellation behavior, and durability outcomes.
 5. Confirm that byte-layout or semantic changes either preserve format v1
@@ -40,6 +62,25 @@ Every candidate must pass all of the following:
 The golden fixtures are compatibility evidence, not writer snapshots to be
 regenerated when a test fails. Add a new fixture for a new format or historical
 writer; never replace old bytes in place.
+
+## First public candidate transition
+
+The first public candidate changes statements that are intentionally true only
+while the repository is unpublished. Its reviewed release commit must:
+
+- set `Cargo.toml` to `1.0.0-rc.1` and create the dated changelog section;
+- replace the unpublished-compatibility notices in `README.md`,
+  `docs/file-format.md`, and `docs/operations.md` with the now-binding format-v1
+  and public-API policy;
+- confirm the crate name and publishing ownership before creating a tag;
+- dispatch `Release qualification` with `establish_api_baseline`, after a
+  manual review of the exported Rust API and format-v1 specification; and
+- after publication, generate a representative root with the registry artifact
+  and retain it as a new immutable published-writer fixture without replacing
+  the existing pre-public fixture.
+
+Later candidates use the previous published candidate as `baseline_version`
+and must open both the pre-public and every published-writer fixture.
 
 ## Reliability qualification
 
@@ -91,13 +132,15 @@ For every candidate:
 
 1. update `CHANGELOG.md` with the version and date;
 2. run the complete locked command list in the root README;
-3. run `cargo publish --dry-run --locked` and inspect the packaged file list;
-4. verify the crate metadata, repository link, README, license, and docs.rs
+3. dispatch `Release qualification` at the candidate commit with the exact
+   version and applicable API-baseline input, and retain the successful run;
+4. inspect the packaged file list and crate archive produced by Cargo;
+5. verify the crate metadata, repository link, README, license, and docs.rs
    rendering;
-5. create a signed `v<version>` tag from the reviewed merge commit;
-6. publish only with explicit owner authorization;
-7. create a GitHub release containing the sanitized qualification summary; and
-8. verify that a new empty root and a copied golden root both work with the
+6. create a signed `v<version>` tag from the reviewed merge commit;
+7. publish only with explicit owner authorization;
+8. create a GitHub release containing the sanitized qualification summary; and
+9. verify that a new empty root and a copied golden root both work with the
    registry artifact, not only the repository checkout.
 
 ## Rollback

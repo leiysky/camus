@@ -1,0 +1,141 @@
+name: Release qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: Exact candidate version in Cargo.toml and CHANGELOG.md
+        required: true
+        type: string
+      baseline_version:
+        description: Published crates.io version used as the SemVer baseline
+        required: false
+        type: string
+      establish_api_baseline:
+        description: Allow no baseline only for the first public candidate
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      EXPECTED_VERSION: ${{ inputs.expected_version }}
+      BASELINE_VERSION: ${{ inputs.baseline_version }}
+      ESTABLISH_API_BASELINE: ${{ inputs.establish_api_baseline }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Toolchain
+        run: rustup show active-toolchain
+
+      - name: Validate candidate metadata and baseline policy
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "camus") | .version')"
+          if [[ "$version" != "$EXPECTED_VERSION" ]]; then
+            echo "Cargo.toml version '$version' does not match '$EXPECTED_VERSION'" >&2
+            exit 1
+          fi
+          if ! grep -F "## [$EXPECTED_VERSION] - " CHANGELOG.md \
+            | grep -Eq '^## \[[^]]+\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            echo "CHANGELOG.md has no ISO-dated heading for $EXPECTED_VERSION" >&2
+            exit 1
+          fi
+          if git rev-parse --quiet --verify "refs/tags/v$EXPECTED_VERSION"; then
+            echo "tag v$EXPECTED_VERSION already exists" >&2
+            exit 1
+          fi
+          if [[ -n "$BASELINE_VERSION" && "$ESTABLISH_API_BASELINE" == "true" ]]; then
+            echo "select a baseline version or establish the first baseline, not both" >&2
+            exit 1
+          fi
+          if [[ "$BASELINE_VERSION" == "$EXPECTED_VERSION" ]]; then
+            echo "the candidate and baseline versions must differ" >&2
+            exit 1
+          fi
+          if [[ -z "$BASELINE_VERSION" && "$ESTABLISH_API_BASELINE" != "true" ]]; then
+            echo "a baseline version is required after the first public candidate" >&2
+            exit 1
+          fi
+          echo "PACKAGE_ROOT=target/package/camus-$version" >> "$GITHUB_ENV"
+
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+          cargo fmt --all --check --manifest-path benchmarks/Cargo.toml
+          cargo fmt --all --check --manifest-path smoke/Cargo.toml
+
+      - name: Clippy
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path benchmarks/Cargo.toml \
+            --all-targets --no-default-features --features redb-engine -- -D warnings
+          cargo clippy --locked --manifest-path smoke/Cargo.toml \
+            --all-targets -- -D warnings
+
+      - name: Tests and documentation
+        run: |
+          cargo test --locked --lib --tests
+          cargo test --locked --release --lib --tests
+          cargo test --locked --doc
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+
+      - name: Repository-only workspaces
+        run: |
+          cargo check --locked --manifest-path fuzz/Cargo.toml
+          cargo test --locked --manifest-path benchmarks/Cargo.toml \
+            --no-default-features --features redb-engine
+          cargo test --locked --manifest-path smoke/Cargo.toml
+
+      - name: Install dependency policy tools
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Dependency policy
+        run: |
+          cargo audit --deny warnings
+          cargo audit --deny warnings --file fuzz/Cargo.lock
+          cargo audit --deny warnings --file benchmarks/Cargo.lock
+          cargo audit --deny warnings --file smoke/Cargo.lock
+          cargo deny --locked check -A license-not-encountered licenses sources
+          cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
+          cargo deny --locked --manifest-path benchmarks/Cargo.toml \
+            --no-default-features --features redb-engine \
+            check -A license-not-encountered licenses sources
+          cargo deny --locked --manifest-path smoke/Cargo.toml \
+            check -A license-not-encountered licenses sources
+
+      - name: Install SemVer checker
+        if: ${{ inputs.baseline_version != '' }}
+        run: cargo install cargo-semver-checks --locked --version 0.48.0
+
+      - name: Check public API compatibility
+        if: ${{ inputs.baseline_version != '' }}
+        run: >-
+          cargo semver-checks --baseline-version "$BASELINE_VERSION"
+          --release-type patch
+
+      - name: Record first public API baseline
+        if: ${{ inputs.establish_api_baseline }}
+        run: echo "This first public candidate establishes the reviewed API baseline."
+
+      - name: Package and dry-run publication
+        run: |
+          cargo package --locked
+          cargo test --locked --manifest-path "$PACKAGE_ROOT/Cargo.toml" --lib --tests
+          cargo publish --dry-run --locked

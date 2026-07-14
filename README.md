@@ -433,7 +433,14 @@ cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
 cargo deny --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine check -A license-not-encountered licenses sources
 cargo deny --locked --manifest-path smoke/Cargo.toml check -A license-not-encountered licenses sources
 cargo package --locked
+cargo publish --dry-run --locked
 ```
+
+Release candidates additionally use the manual-only
+[`Release qualification`](docs/releasing.md#manual-release-qualification)
+workflow to validate candidate metadata, the applicable public-API baseline,
+and tests executed from Cargo's extracted package source. The workflow never
+publishes or tags a release.
 
 ## License
 
