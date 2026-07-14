@@ -143,14 +143,39 @@ pub(super) fn atomic_replace(
         .write(true)
         .open(temporary)
         .map_err(|error| Error::io("create temporary file", temporary, outcome, error))?;
+    #[cfg(test)]
+    if let Some(error) =
+        crate::test_crash::injected_io_error_for_path("atomic_replace.short_write", canonical)
+    {
+        let prefix = bytes.len().div_ceil(2);
+        file.write_all(&bytes[..prefix])
+            .map_err(|error| Error::io("write temporary file", temporary, outcome, error))?;
+        return Err(Error::io("write temporary file", temporary, outcome, error));
+    }
     file.write_all(bytes)
         .map_err(|error| Error::io("write temporary file", temporary, outcome, error))?;
+    #[cfg(test)]
+    crate::test_crash::inject_io_for_path("atomic_replace.sync_data", canonical)
+        .map_err(|error| Error::io("sync temporary file", temporary, outcome, error))?;
     file.sync_data()
         .map_err(|error| Error::io("sync temporary file", temporary, outcome, error))?;
+    #[cfg(test)]
+    crate::test_crash::hit_for_path("atomic_replace.after_data_sync", canonical);
     drop(file);
+    #[cfg(test)]
+    crate::test_crash::inject_io_for_path("atomic_replace.rename", canonical)
+        .map_err(|error| Error::io("publish temporary file", canonical, outcome, error))?;
     fs::rename(temporary, canonical)
         .map_err(|error| Error::io("publish temporary file", canonical, outcome, error))?;
-    sync_directory(directory, outcome)
+    #[cfg(test)]
+    crate::test_crash::hit_for_path("atomic_replace.after_rename", canonical);
+    #[cfg(test)]
+    crate::test_crash::inject_io_for_path("atomic_replace.directory_sync", canonical)
+        .map_err(|error| Error::io("sync directory", directory, outcome, error))?;
+    sync_directory(directory, outcome)?;
+    #[cfg(test)]
+    crate::test_crash::hit_for_path("atomic_replace.after_directory_sync", canonical);
+    Ok(())
 }
 
 pub(super) fn read_complete_file(path: &Path) -> Result<Vec<u8>> {

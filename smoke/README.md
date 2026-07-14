@@ -19,3 +19,11 @@ cargo run --locked --release --manifest-path smoke/Cargo.toml -- run \
 
 See [`docs/long-running-smoke.md`](../docs/long-running-smoke.md) for the
 workload model, metric definitions, pass criteria, and report handling.
+
+The same binary also performs an externally killed large-backlog recovery
+qualification and writes a local JSON report:
+
+```sh
+cargo run --locked --release --manifest-path smoke/Cargo.toml -- backlog \
+  --records 1000000
+```

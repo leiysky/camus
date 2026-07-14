@@ -11,6 +11,8 @@ on:
       - fuzz/Cargo.lock
       - benchmarks/Cargo.toml
       - benchmarks/Cargo.lock
+      - smoke/Cargo.toml
+      - smoke/Cargo.lock
   pull_request:
     paths:
       - Cargo.toml
@@ -20,6 +22,8 @@ on:
       - fuzz/Cargo.lock
       - benchmarks/Cargo.toml
       - benchmarks/Cargo.lock
+      - smoke/Cargo.toml
+      - smoke/Cargo.lock
   schedule:
     - cron: "41 4 * * 1"
   workflow_dispatch:
@@ -45,10 +49,14 @@ jobs:
         run: cargo audit --deny warnings --file fuzz/Cargo.lock
       - name: Audit benchmark dependencies
         run: cargo audit --deny warnings --file benchmarks/Cargo.lock
+      - name: Audit smoke dependencies
+        run: cargo audit --deny warnings --file smoke/Cargo.lock
       - name: Check dependency licenses and sources
         run: |
           cargo deny --locked check -A license-not-encountered licenses sources
           cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
           cargo deny --locked --manifest-path benchmarks/Cargo.toml \
             --no-default-features --features redb-engine \
+            check -A license-not-encountered licenses sources
+          cargo deny --locked --manifest-path smoke/Cargo.toml \
             check -A license-not-encountered licenses sources

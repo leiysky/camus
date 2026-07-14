@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod crash_tests;
 mod files;
 mod manifest;
 mod segment;
@@ -891,6 +893,8 @@ impl Storage {
         }
         self.manifest
             .append_group(&bodies, DurabilityOutcome::Unknown)?;
+        #[cfg(test)]
+        crate::test_crash::hit("release.after_manifest_sync");
         self.commits.release_groups = self.commits.release_groups.saturating_add(1);
         self.commits.release_units = self.commits.release_units.saturating_add(release_units);
         self.commits.release_records = self.commits.release_records.saturating_add(release_records);
@@ -999,6 +1003,8 @@ impl Storage {
                 &[ManifestBody::SegmentRemoved(body.clone())],
                 DurabilityOutcome::Unknown,
             )?;
+            #[cfg(test)]
+            crate::test_crash::hit("reclaim.after_manifest_sync");
             for highwater in &body.highwaters {
                 self.streams
                     .get_mut(&highwater.stream_id)
@@ -1020,6 +1026,15 @@ impl Storage {
                 .expect("eligible segment byte accounting is exact");
             let path = segment.path.clone();
             drop(segment);
+            #[cfg(test)]
+            crate::test_crash::inject_io("reclaim.delete").map_err(|error| {
+                Error::io(
+                    "delete reclaimed segment",
+                    &path,
+                    DurabilityOutcome::Unknown,
+                    error,
+                )
+            })?;
             fs::remove_file(&path).map_err(|error| {
                 Error::io(
                     "delete reclaimed segment",
@@ -1028,7 +1043,20 @@ impl Storage {
                     error,
                 )
             })?;
+            #[cfg(test)]
+            crate::test_crash::hit("reclaim.after_delete");
+            #[cfg(test)]
+            crate::test_crash::inject_io("reclaim.directory_sync").map_err(|error| {
+                Error::io(
+                    "sync segment directory",
+                    &self.segments_directory,
+                    DurabilityOutcome::Unknown,
+                    error,
+                )
+            })?;
             sync_directory(&self.segments_directory, DurabilityOutcome::Unknown)?;
+            #[cfg(test)]
+            crate::test_crash::hit("reclaim.after_directory_sync");
             report.segments = report.segments.saturating_add(1);
             report.bytes = report.bytes.saturating_add(bytes);
             self.maintenance.reclaimed_segments =
@@ -1125,6 +1153,8 @@ impl Storage {
             })],
             DurabilityOutcome::Unknown,
         )?;
+        #[cfg(test)]
+        crate::test_crash::hit("seal.after_manifest_sync");
         if self.segments[&segment_id].unreleased_records == 0 {
             self.reclaimable_segments = self.reclaimable_segments.saturating_add(1);
             self.reclaimable_bytes = self

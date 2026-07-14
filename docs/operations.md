@@ -7,7 +7,7 @@ are in [file-format.md](file-format.md).
 
 ## Supported storage environment
 
-Camus currently supports Unix targets and assumes a local filesystem where:
+The 1.0 support matrix covers Linux and macOS on local filesystems where:
 
 - `sync_data` durably publishes preceding file data and required size metadata;
 - directory `sync_all` durably publishes create, rename, and delete operations;
@@ -19,6 +19,10 @@ asynchronous replicas, or caches that ignore flushes without validating that
 stack's complete failure behavior. Keep `ROOT`, both manifest files, and
 `segments/` on one filesystem. Restrict direct write access; checksums detect
 accidents, not malicious modification.
+
+Other Unix targets may compile, but remain outside the 1.0 support matrix until
+their locking, sync, rename, deletion, recovery, and process-crash behavior is
+covered by the same qualification suite.
 
 ## Ownership and runtime
 

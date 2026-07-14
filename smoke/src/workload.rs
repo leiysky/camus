@@ -392,7 +392,7 @@ async fn wait_for_gate(
     }
 }
 
-fn make_record(
+pub(crate) fn make_record(
     producer_id: u64,
     sequence: u64,
     metadata_bytes: usize,
@@ -417,37 +417,48 @@ fn make_record(
     }
 }
 
-fn validate_record(
+pub(crate) fn validate_record(
     record: &PendingRecord,
     expected_stream: u64,
     stream_count: u64,
 ) -> Result<(u64, u64)> {
+    validate_record_bytes(
+        &record.metadata,
+        &record.payload,
+        expected_stream,
+        stream_count,
+    )
+}
+
+fn validate_record_bytes(
+    metadata: &[u8],
+    payload: &[u8],
+    expected_stream: u64,
+    stream_count: u64,
+) -> Result<(u64, u64)> {
     ensure!(
-        record.metadata.len() >= METADATA_HEADER_BYTES,
+        metadata.len() >= METADATA_HEADER_BYTES,
         "record metadata is truncated"
     );
     ensure!(
-        &record.metadata[..8] == RECORD_MAGIC,
+        &metadata[..8] == RECORD_MAGIC,
         "record metadata magic mismatch"
     );
-    let producer_id = read_u64(&record.metadata[8..16]);
-    let sequence = read_u64(&record.metadata[16..24]);
+    let producer_id = read_u64(&metadata[8..16]);
+    let sequence = read_u64(&metadata[16..24]);
     ensure!(
         producer_id % stream_count == expected_stream,
         "record payload belongs to the wrong logical stream"
     );
     ensure!(
         check_pattern(
-            &record.metadata[METADATA_HEADER_BYTES..],
+            &metadata[METADATA_HEADER_BYTES..],
             record_seed(producer_id, sequence, METADATA_SEED),
         ),
         "record metadata pattern mismatch"
     );
     ensure!(
-        check_pattern(
-            &record.payload,
-            record_seed(producer_id, sequence, PAYLOAD_SEED),
-        ),
+        check_pattern(payload, record_seed(producer_id, sequence, PAYLOAD_SEED),),
         "record payload pattern mismatch"
     );
     Ok((producer_id, sequence))
@@ -497,17 +508,11 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camus::RecordId;
 
     #[test]
     fn generated_record_validates_without_allocation() {
         let record = make_record(7, 42, 32, 4096);
-        let pending = PendingRecord {
-            id: RecordId::from_bytes([1; RecordId::BYTE_LEN]),
-            metadata: record.metadata,
-            payload: record.payload,
-        };
-        validate_record(&pending, 3, 4).unwrap();
+        validate_record_bytes(&record.metadata, &record.payload, 3, 4).unwrap();
     }
 
     #[test]
@@ -515,13 +520,8 @@ mod tests {
         let record = make_record(7, 42, 32, 128);
         let mut payload = record.payload.to_vec();
         payload[31] ^= 1;
-        let pending = PendingRecord {
-            id: RecordId::from_bytes([1; RecordId::BYTE_LEN]),
-            metadata: record.metadata,
-            payload: Bytes::from(payload),
-        };
-        assert!(validate_record(&pending, 3, 4).is_err());
-        assert!(validate_record(&pending, 2, 4).is_err());
+        assert!(validate_record_bytes(&record.metadata, &payload, 3, 4).is_err());
+        assert!(validate_record_bytes(&record.metadata, &payload, 2, 4).is_err());
     }
 
     #[test]

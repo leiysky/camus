@@ -399,6 +399,8 @@ not protect against an attacker who can rewrite bytes and recompute them.
   comparison-engine mappings, and regression comparison.
 - [Long-running smoke guide](docs/long-running-smoke.md): cyclic capacity
   pressure, latency telemetry, VictoriaMetrics reporting, and pass criteria.
+- [Release guide](docs/releasing.md): RC qualification, compatibility gates,
+  required repository settings, packaging, publication, and rollback.
 - [Runnable examples](examples/README.md): replay, waiting reads, multi-stream
   use, maintenance, and observability.
 
@@ -412,6 +414,7 @@ cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 cargo fmt --all --check --manifest-path benchmarks/Cargo.toml
 cargo fmt --all --check --manifest-path smoke/Cargo.toml
 cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --manifest-path smoke/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --lib --tests
 cargo test --locked --release --lib --tests
 cargo test --locked --doc
@@ -429,3 +432,7 @@ cargo deny --locked --manifest-path benchmarks/Cargo.toml --no-default-features 
 cargo deny --locked --manifest-path smoke/Cargo.toml check -A license-not-encountered licenses sources
 cargo package --locked
 ```
+
+## License
+
+Camus is licensed under the [Apache License 2.0](LICENSE-APACHE).
