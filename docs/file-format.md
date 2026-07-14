@@ -30,10 +30,11 @@ It does not encode consumer identity, attempts, subscriptions, claims,
 application schemas, cross-stream ordering, compression, encryption, or
 authentication.
 
-This target v1 directly replaces the repository's earlier unpublished format.
-There is no migration or compatibility requirement for those old bytes. Once
-this target is published, the compatibility rules at the end of this document
-apply.
+Release `1.0.0-rc.1` establishes this format v1 as the published compatibility
+boundary. There is no migration or compatibility requirement for bytes written
+by earlier unpublished development revisions. The compatibility rules at the
+end of this document apply to roots written by `1.0.0-rc.1` and later
+compatible releases.
 
 ## Primitive encoding
 

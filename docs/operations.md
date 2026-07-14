@@ -176,9 +176,11 @@ traffic.
 
 ## Upgrade policy
 
-The project is pre-release and format v1 is strict. Unsupported magic,
-versions, kinds, lengths, ordering, or noncanonical encodings fail closed; an
-old reader does not silently ignore new state.
+Starting with `1.0.0-rc.1`, format v1 is a published compatibility boundary.
+Unsupported magic, versions, kinds, lengths, ordering, or noncanonical
+encodings fail closed; an old reader does not silently ignore new state.
+Roots written by earlier unpublished development revisions are outside this
+boundary and are not migration inputs.
 
 Before an upgrade:
 

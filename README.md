@@ -11,9 +11,11 @@ provides no arbitrary queries, mutable records, networking, consumer ownership,
 routing, retry scheduling, or exactly-once effects. The embedding application
 owns delivery policy and downstream idempotency.
 
-> **Pre-release compatibility:** no published API or on-disk compatibility
-> exists yet. This format-v1 implementation may replace earlier unpublished
-> repository roots rather than migrating them.
+> **Compatibility commitment:** starting with `1.0.0-rc.1`, the public Rust API
+> follows Semantic Versioning and format-v1 roots remain readable by later
+> compatible releases. Incompatible persistent changes require a new explicit
+> format version and migration design. Earlier unpublished development roots
+> are outside this compatibility boundary.
 
 ## Core contract
 
@@ -367,10 +369,11 @@ release, and reclamation invariants are defined in
 [docs/architecture.md](docs/architecture.md). Unsupported or ambiguous
 authoritative data fails closed.
 
-The project has not published a compatible format. This redesign directly
-replaces the earlier repository format while retaining the name "format v1".
-Once this v1 is published, changing a magic, field, checksum range, codec, or
-semantic interpretation requires an explicit new format version.
+Release `1.0.0-rc.1` establishes format v1 as the published compatibility
+boundary. Earlier unpublished development roots are not migration inputs.
+Starting with this candidate, changing a magic, field, checksum range, codec,
+or semantic interpretation requires an explicit new format version and
+migration design.
 
 ## Deployment envelope
 
