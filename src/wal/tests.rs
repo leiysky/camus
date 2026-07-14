@@ -125,6 +125,24 @@ fn version_one_wire_codecs_have_stable_bytes() {
         release_metadata
     );
     assert_eq!(
+        serde_json::to_vec(&SegmentRotationV1 {
+            shard_id: 7,
+            previous_segment_id: Some(9),
+            new_segment_id: 10,
+            created_at_unix_millis: Some(123),
+        })
+        .unwrap(),
+        br#"{"shard_id":7,"previous_segment_id":9,"new_segment_id":10,"created_at_unix_millis":123}"#
+    );
+    assert_eq!(
+        serde_json::to_vec(&SegmentRemovalV1 {
+            shard_id: 7,
+            segment_ids: vec![1, 2],
+        })
+        .unwrap(),
+        br#"{"shard_id":7,"segment_ids":[1,2]}"#
+    );
+    assert_eq!(
         serde_json::to_vec(&SegmentSnapshotV1 {
             shard_id: 0,
             segment_id: 9,

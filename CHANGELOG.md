@@ -9,6 +9,9 @@ version numbers.
 
 - Initial embedded staging-log API with batched durability epochs.
 - Checksummed segment and manifest format version 1.
+- Normative version-1 file-format specification with exact byte layouts,
+  checksum ranges, manifest schemas, repair boundaries, compatibility rules,
+  and stable codec vectors.
 - Lazy validated payload reads, durable release, ordered segment reclamation,
   and manifest checkpoint compaction.
 - Multiple logical streams with independent record identity, segment

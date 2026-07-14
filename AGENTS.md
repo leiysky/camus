@@ -5,6 +5,8 @@ This file applies to the entire repository.
 ## Sources of truth
 
 - `README.md` defines the public project boundary and API expectations.
+- `docs/file-format.md` defines the versioned byte layouts, checksums, codecs,
+  validation rules, and compatibility boundary.
 - `docs/architecture.md` defines the on-disk ordering, recovery, release, and
   reclamation invariants.
 - Keep the crate application-neutral. Do not add application schemas, ingest

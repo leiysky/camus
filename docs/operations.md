@@ -207,6 +207,8 @@ after their complete segment set validates successfully.
 Once that timestamp or any nondefault-stream event is written, a pre-release
 binary that does not understand those version-1 record kinds will fail closed;
 use the closed-root backup for rollback rather than trying to strip events.
+The frozen layouts, checksums, event schemas, and compatibility rules are in
+[file-format.md](file-format.md).
 
 Before upgrading:
 

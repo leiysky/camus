@@ -162,6 +162,8 @@ Camus intentionally does not provide:
 ## Documentation
 
 - [Usage guide](docs/usage.md): end-to-end API composition and common mistakes.
+- [File format](docs/file-format.md): normative version-1 byte layouts,
+  checksums, manifest schemas, repair boundaries, and stable vectors.
 - [Architecture](docs/architecture.md): durability, recovery, ordering, and
   on-disk invariants.
 - [Operations guide](docs/operations.md): supported filesystems, capacity,
@@ -211,8 +213,9 @@ stream-scoped manifest events and persisted segment creation times.
 Unsupported or corrupt authoritative data fails closed; Camus does not infer
 or reinterpret another system's log format.
 
-The full durability and recovery contract is documented in
-[docs/architecture.md](docs/architecture.md).
+The exact version-1 encoding is specified in
+[docs/file-format.md](docs/file-format.md). The durability and recovery
+contract is documented in [docs/architecture.md](docs/architecture.md).
 
 ## Development
 

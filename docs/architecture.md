@@ -3,6 +3,10 @@
 This document defines Camus's on-disk stream, rollover, ordering, recovery,
 release, and reclamation contract.
 
+The exact version-1 byte layouts, checksum inputs, manifest schemas, and codec
+compatibility boundary are specified separately in
+[file-format.md](file-format.md).
+
 ## Boundary
 
 Camus is an embedded durable staging log. It understands only four caller
