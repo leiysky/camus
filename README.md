@@ -374,10 +374,12 @@ semantic interpretation requires an explicit new format version.
 
 ## Deployment envelope
 
-Camus targets local Unix filesystems that honor file data sync, directory
-sync, exclusive advisory locking, and atomic same-directory rename. A network,
-userspace, or layered filesystem is outside the durability envelope unless its
-behavior has been independently validated.
+Camus 1.0 targets Linux local filesystems that honor file data sync, directory
+sync, exclusive advisory locking, and atomic same-directory rename. macOS is a
+development environment, not part of the production durability support matrix
+or required CI and release qualification. A network, userspace, or layered
+filesystem is outside the durability envelope unless its behavior has been
+independently validated.
 
 One process owner opens a root at a time. Back up a closed root or use an
 atomic filesystem snapshot; do not copy a live root file by file. Checksums do

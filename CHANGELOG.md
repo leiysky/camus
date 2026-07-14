@@ -40,11 +40,12 @@ version numbers.
   pressure, deterministic delivery validation, interval throughput and latency
   metrics, VictoriaMetrics ingestion verification, sanitized reports, and an
   externally killed large-backlog reopen/verify/drain qualification mode.
-- Pre-1.0 release gates covering Linux and macOS CI, every workspace lockfile,
-  semver and format review, immutable format-v1 golden-root reopen tests, and
-  an explicit release-candidate procedure.
+- Pre-1.0 release gates covering Linux CI, every workspace lockfile, semver and
+  format review, immutable format-v1 golden-root reopen tests, and an explicit
+  release-candidate procedure.
 - Deterministic subprocess crash and I/O-fault recovery matrices across append,
   seal, release, reclamation, checkpoint, and manifest publication, including
   `ENOSPC`, `EIO`, partial-tail repair, and conservative unknown durability.
-- Forward-extensible public errors and snapshot/report structs, plus explicit
-  Linux and macOS support boundaries for 1.0 qualification.
+- Forward-extensible public errors and snapshot/report structs, plus an
+  explicit Linux production support boundary and macOS development-only
+  status for 1.0 qualification.

@@ -8,7 +8,7 @@ in `ROOT`. A crate release must not silently redefine either surface.
 
 Before publishing a release candidate or stable version, the repository must:
 
-- require the semantic-title, quality, Linux, macOS, current-stable, and
+- require the semantic-title, quality, Linux, current-stable, and
   dependency-policy checks on `main`;
 - disallow direct pushes and force-pushes to `main`;
 - enable GitHub private vulnerability reporting when the repository becomes
@@ -67,13 +67,15 @@ contents, a filesystem that violates documented sync ordering, torn sectors,
 or a failing physical device. A candidate revision must additionally complete:
 
 - at least 24 hours of the capacity-cycle smoke workload on Linux/ext4;
-- at least 6 hours on macOS/APFS;
 - repeated external `SIGKILL` and reopen while append, release, rollover,
   checkpoint, and reclamation are active;
-- platform-appropriate power-loss or block-device fault testing for the sync
-  ordering claimed by the candidate;
+- Linux power-loss or block-device fault testing for the sync ordering claimed
+  by the candidate;
 - a representative large-root recovery measurement covering startup time,
   first-read latency, RSS, record count, stream count, and segment topology.
+
+macOS validation is useful during development but is not a release gate or a
+production durability qualification target for 1.0.
 
 Raw host reports stay outside the repository. Attach a sanitized aggregate
 report to the release candidate and record its exact commit and configuration.
