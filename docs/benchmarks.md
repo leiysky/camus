@@ -234,6 +234,12 @@ for a correctness smoke. Full RocksDB comparisons and performance measurements
 remain manual work on a controlled Linux host and never gate ordinary
 development.
 
+The comparison runner is intentionally finite and uses a fresh root per case.
+It is not the long-running capacity test. Use the separate `smoke/` crate and
+[`long-running smoke protocol`](long-running-smoke.md) to observe a single
+bounded Camus root across repeated high-water, blocked-admission, reclamation,
+and recovery cycles.
+
 ## Report handling
 
 Keep raw JSON reports and machine-specific notes under ignored `target/`

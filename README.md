@@ -397,6 +397,8 @@ not protect against an attacker who can rewrite bytes and recompute them.
   health transitions, and adapter guidance.
 - [Benchmark guide](docs/benchmarks.md): reproducible durable-buffer workloads,
   comparison-engine mappings, and regression comparison.
+- [Long-running smoke guide](docs/long-running-smoke.md): cyclic capacity
+  pressure, latency telemetry, VictoriaMetrics reporting, and pass criteria.
 - [Runnable examples](examples/README.md): replay, waiting reads, multi-stream
   use, maintenance, and observability.
 
@@ -408,6 +410,7 @@ Before publishing, run:
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 cargo fmt --all --check --manifest-path benchmarks/Cargo.toml
+cargo fmt --all --check --manifest-path smoke/Cargo.toml
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --lib --tests
 cargo test --locked --release --lib --tests
@@ -415,11 +418,14 @@ cargo test --locked --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo check --locked --manifest-path fuzz/Cargo.toml
 cargo test --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine
+cargo test --locked --manifest-path smoke/Cargo.toml
 cargo audit --deny warnings
 cargo audit --deny warnings --file fuzz/Cargo.lock
 cargo audit --deny warnings --file benchmarks/Cargo.lock
+cargo audit --deny warnings --file smoke/Cargo.lock
 cargo deny --locked check -A license-not-encountered licenses sources
 cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
 cargo deny --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine check -A license-not-encountered licenses sources
+cargo deny --locked --manifest-path smoke/Cargo.toml check -A license-not-encountered licenses sources
 cargo package --locked
 ```

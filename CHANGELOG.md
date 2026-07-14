@@ -36,3 +36,6 @@ version numbers.
   and regression comparison; the native RocksDB dependency is strictly opt-in,
   and its measurements are disabled on macOS so `fsync` is not compared with
   Rust's stronger `F_FULLFSYNC` boundary.
+- Standalone manual long-running smoke crate with cyclic bounded-capacity
+  pressure, deterministic delivery validation, interval throughput and latency
+  metrics, VictoriaMetrics ingestion verification, and sanitized reports.
