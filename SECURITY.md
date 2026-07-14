@@ -2,9 +2,11 @@
 
 ## Supported versions
 
-Until the first stable release, security fixes are made on the latest `0.1.x`
-release line and the default branch. Older prerelease revisions are not
-maintained independently.
+Until the first stable release, security fixes are made on the default branch
+and the latest published `1.0.0-rc.N` candidate, if one exists. Superseded
+candidates and unpublished revisions are not maintained independently. After
+1.0, fixes target the latest `1.x` release and the default branch unless an
+advisory explicitly states a wider supported range.
 
 ## Reporting a vulnerability
 
