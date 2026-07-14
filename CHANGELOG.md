@@ -27,3 +27,9 @@ version numbers.
   guides, runnable replay/readiness/multi-stream/maintenance examples, focused
   corruption tests, cross-process locking tests, and segment/manifest recovery
   fuzz targets.
+- Standalone durability-matched benchmark runner for Camus, a simple append
+  file, RocksDB, and redb, with sequential, concurrent, batch, verified-read,
+  exact-release, drain, and warm-restart workloads plus versioned JSON reports
+  and regression comparison; the native RocksDB dependency is strictly opt-in,
+  and its measurements are disabled on macOS so `fsync` is not compared with
+  Rust's stronger `F_FULLFSYNC` boundary.

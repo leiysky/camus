@@ -1,14 +1,15 @@
 # Camus
 
-Camus is an embedded persistent buffer for opaque records. It gives an
-application one local `append -> read -> release -> reclaim` lifecycle with an
-at-least-once storage handoff: an append that reports success remains
-recoverable until release is durable.
+Camus is a purpose-built embedded persistent buffer for opaque records. It is
+designed for local spools, embedded outboxes, upload staging, and durable
+write-behind workloads that follow one `append -> read -> release -> reclaim`
+lifecycle. An append that reports success remains recoverable until release is
+durable, providing an at-least-once storage handoff.
 
-Camus is intentionally smaller than a broker or database. It does not create
-consumers, route events, execute callbacks, interpret schemas, contact a
-downstream system, or promise exactly-once effects. The embedding application
-owns those policies.
+Camus is not a general-purpose KV database or a message broker. It intentionally
+provides no arbitrary queries, mutable records, networking, consumer ownership,
+routing, retry scheduling, or exactly-once effects. The embedding application
+owns delivery policy and downstream idempotency.
 
 > **Pre-release compatibility:** no published API or on-disk compatibility
 > exists yet. This format-v1 implementation may replace earlier unpublished
@@ -361,6 +362,8 @@ not protect against an attacker who can rewrite bytes and recompute them.
   shutdown.
 - [Operations guide](docs/operations.md): supported deployment and failure
   response.
+- [Benchmark guide](docs/benchmarks.md): reproducible durable-buffer workloads,
+  comparison-engine mappings, and regression comparison.
 - [Runnable examples](examples/README.md): replay, waiting reads, multi-stream
   use, and maintenance.
 
@@ -371,15 +374,19 @@ Before publishing, run:
 ```sh
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+cargo fmt --all --check --manifest-path benchmarks/Cargo.toml
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --lib --tests
 cargo test --locked --release --lib --tests
 cargo test --locked --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo check --locked --manifest-path fuzz/Cargo.toml
+cargo test --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine
 cargo audit --deny warnings
 cargo audit --deny warnings --file fuzz/Cargo.lock
+cargo audit --deny warnings --file benchmarks/Cargo.lock
 cargo deny --locked check -A license-not-encountered licenses sources
 cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
+cargo deny --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine check -A license-not-encountered licenses sources
 cargo package --locked
 ```
