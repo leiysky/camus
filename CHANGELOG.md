@@ -7,6 +7,10 @@ version numbers.
 
 ## Unreleased
 
+- Immutable format-v1 compatibility fixture written by the published
+  `1.0.0-rc.1` registry artifact, with reopen, pending-state, release-state,
+  append, and subsequent-reader tests.
+
 ## [1.0.0-rc.1] - 2026-07-14
 
 - Initial embedded persistent-buffer API with async `Log` and lightweight
