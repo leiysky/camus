@@ -1,12 +1,12 @@
-use camus::{Config, Error, Log};
+use camus::{Capacity, Config, Error, Log};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 const HELPER_ROOT: &str = "CAMUS_PROCESS_LOCK_HELPER_ROOT";
 const READY: &str = "CAMUS_PROCESS_LOCK_READY";
 
-#[test]
-fn storage_root_lock_is_exclusive_across_processes() {
+#[tokio::test]
+async fn storage_root_lock_is_exclusive_across_processes() {
     let directory = tempfile::tempdir().unwrap();
     let executable = std::env::current_exe().unwrap();
     let mut child = Command::new(executable)
@@ -22,43 +22,38 @@ fn storage_root_lock_is_exclusive_across_processes() {
     loop {
         line.clear();
         let read = stdout.read_line(&mut line).unwrap();
-        assert_ne!(
-            read, 0,
-            "lock-holder child exited before acquiring the lock"
-        );
+        assert_ne!(read, 0, "lock-holder exited before acquiring the lock");
         if line.contains(READY) {
             break;
         }
     }
 
-    let second_open = Log::open(Config::new(directory.path()));
+    let second_open = Log::open(Config::new(directory.path(), Capacity::Unbounded)).await;
     child.stdin.take().unwrap().write_all(b"x").unwrap();
     let mut remaining_output = String::new();
     stdout.read_to_string(&mut remaining_output).unwrap();
     let status = child.wait().unwrap();
-    assert!(
-        status.success(),
-        "lock-holder child failed: {remaining_output}"
-    );
+    assert!(status.success(), "lock-holder failed: {remaining_output}");
+    assert!(matches!(second_open, Err(Error::RootInUse { .. })));
 
-    let error = second_open
-        .err()
-        .expect("a second process must not acquire the root lock");
-    assert!(matches!(error, Error::RootInUse(_)));
-
-    drop(Log::open(Config::new(directory.path())).unwrap());
+    let log = Log::open(Config::new(directory.path(), Capacity::Unbounded))
+        .await
+        .unwrap();
+    log.shutdown().await.unwrap();
 }
 
-#[test]
-fn lock_holder_helper() {
+#[tokio::test]
+async fn lock_holder_helper() {
     let Some(root) = std::env::var_os(HELPER_ROOT) else {
         return;
     };
-    let log = Log::open(Config::new(root)).unwrap();
+    let log = Log::open(Config::new(root, Capacity::Unbounded))
+        .await
+        .unwrap();
     println!("{READY}");
     std::io::stdout().flush().unwrap();
 
     let mut release = [0_u8; 1];
     std::io::stdin().read_exact(&mut release).unwrap();
-    drop(log);
+    log.shutdown().await.unwrap();
 }

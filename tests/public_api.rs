@@ -1,129 +1,305 @@
-use camus::{Config, Log, Record, RolloverPolicy, StreamId, WaitForStream, DEFAULT_STREAM};
+use bytes::Bytes;
+use camus::{Capacity, Config, Error, FullPolicy, Log, ReadLimits, Record, RecordId, StreamId};
 use std::time::Duration;
 
-struct SignalWake(std::sync::mpsc::Sender<()>);
-
-impl std::task::Wake for SignalWake {
-    fn wake(self: std::sync::Arc<Self>) {
-        let _ = self.0.send(());
-    }
-
-    fn wake_by_ref(self: &std::sync::Arc<Self>) {
-        let _ = self.0.send(());
-    }
+fn config(root: &std::path::Path) -> Config {
+    Config::new(root, Capacity::Unbounded)
 }
 
-fn poll_wait(
-    future: &mut std::pin::Pin<Box<WaitForStream>>,
-    waker: &std::task::Waker,
-) -> std::task::Poll<camus::Result<()>> {
-    let mut context = std::task::Context::from_waker(waker);
-    std::future::Future::poll(future.as_mut(), &mut context)
-}
-
-#[test]
-fn unreleased_record_is_replayed_until_release() {
+#[tokio::test]
+async fn unreleased_record_is_replayed_until_release() {
     let directory = tempfile::tempdir().unwrap();
-    let config = Config::new(directory.path());
+    let stream_id = StreamId::new(7);
+    let id = {
+        let log = Log::open(config(directory.path())).await.unwrap();
+        let stream = log.stream(stream_id);
+        let id = stream
+            .append(
+                Record::new(Bytes::from_static(b"payload"))
+                    .with_metadata(Bytes::from_static(b"metadata")),
+            )
+            .await
+            .unwrap();
+        log.shutdown().await.unwrap();
+        id
+    };
 
-    let mut log = Log::open(config.clone()).unwrap();
-    let location = log
-        .append(
-            Record::new("record-1", b"payload".as_slice()).with_metadata(b"metadata".as_slice()),
-        )
-        .unwrap();
-    assert_eq!(log.read(&location).unwrap(), b"payload".as_slice());
-    drop(log);
-
-    let mut log = Log::open(config.clone()).unwrap();
-    let pending = log.recovery().pending_records();
+    let log = Log::open(config(directory.path())).await.unwrap();
+    let stream = log.stream(stream_id);
+    let pending = stream.read(ReadLimits::new(8, 1024)).await.unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].meta.record_id, "record-1");
-    assert_eq!(pending[0].meta.metadata, b"metadata".as_slice());
-    log.release(["record-1"]).unwrap();
-    drop(log);
+    assert_eq!(pending[0].id, id);
+    assert_eq!(pending[0].metadata, Bytes::from_static(b"metadata"));
+    assert_eq!(pending[0].payload, Bytes::from_static(b"payload"));
+    stream.release(vec![id]).await.unwrap();
+    log.shutdown().await.unwrap();
 
-    let log = Log::open(config).unwrap();
-    assert!(log.recovery().pending_records().is_empty());
+    let log = Log::open(config(directory.path())).await.unwrap();
+    assert_eq!(log.stream(stream_id).stats().pending_records, 0);
+    log.shutdown().await.unwrap();
 }
 
-#[test]
-fn async_wait_for_wakes_a_stream_consumer() {
+#[tokio::test]
+async fn waiting_read_is_woken_by_a_durable_append() {
     let directory = tempfile::tempdir().unwrap();
-    let stream = StreamId::new(7);
-    let mut log = Log::open(Config::new(directory.path())).unwrap();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let waker = std::task::Waker::from(std::sync::Arc::new(SignalWake(sender)));
-    let mut ready = Box::pin(log.wait_for(stream));
-    assert!(poll_wait(&mut ready, &waker).is_pending());
+    let log = Log::open(config(directory.path())).await.unwrap();
+    let stream = log.stream(StreamId::new(11));
+    let waiter_stream = stream.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        started_tx.send(()).unwrap();
+        waiter_stream.read(ReadLimits::new(1, 1024)).await
+    });
+    started_rx.await.unwrap();
 
-    let location = log
-        .append_to(
-            stream,
-            Record::new("event-1", b"payload".as_slice()).with_metadata(b"metadata".as_slice()),
-        )
+    let id = stream
+        .append(Record::new(Bytes::from_static(b"ready")))
+        .await
         .unwrap();
-    receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("waiting read did not wake")
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot[0].id, id);
+    stream.release(vec![id]).await.unwrap();
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn logical_stream_handles_share_pending_state_without_cross_stream_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_id = StreamId::new(21);
+    let second_id = StreamId::new(22);
+    let log = Log::open(config(directory.path())).await.unwrap();
+    let first = log.stream(first_id);
+    let first_again = log.stream(first_id);
+    let second = log.stream(second_id);
+
+    let first_record = first
+        .append(Record::new(Bytes::from_static(b"first")))
+        .await
+        .unwrap();
+    let second_record = second
+        .append(Record::new(Bytes::from_static(b"second")))
+        .await
+        .unwrap();
+    assert_eq!(log.known_streams(), vec![first_id, second_id]);
+
+    let observed = first_again.read(ReadLimits::new(8, 1024)).await.unwrap();
+    assert_eq!(observed[0].id, first_record);
+    first.release(vec![first_record]).await.unwrap();
+    assert_eq!(first_again.stats().pending_records, 0);
+    assert_eq!(second.stats().pending_records, 1);
+
+    second.release(vec![second_record]).await.unwrap();
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_returns_the_longest_in_order_prefix_within_hard_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = Log::open(config(directory.path())).await.unwrap();
+    let stream = log.stream(StreamId::new(25));
+    let ids = stream
+        .append_batch(vec![
+            Record::new(Bytes::from_static(b"one")),
+            Record::new(Bytes::from_static(b"three")),
+            Record::new(Bytes::from_static(b"two")),
+        ])
+        .await
+        .unwrap();
+
+    let error = stream.read(ReadLimits::new(8, 2)).await.unwrap_err();
     assert!(matches!(
-        poll_wait(&mut ready, &waker),
-        std::task::Poll::Ready(Ok(()))
+        error,
+        Error::ReadLimitTooSmall {
+            id,
+            required_bytes: 3,
+            max_bytes: 2,
+        } if id == ids[0]
     ));
-    let pending = log.recovery().pending_records_for(stream);
-    assert_eq!(pending[0].meta.record_id, "event-1");
-    assert_eq!(pending[0].meta.metadata, b"metadata".as_slice());
-    assert_eq!(pending[0].location, location);
+
+    let prefix = stream.read(ReadLimits::new(8, 7)).await.unwrap();
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(prefix[0].id, ids[0]);
+
+    let count_limited = stream.read(ReadLimits::new(2, 8)).await.unwrap();
     assert_eq!(
-        log.read(&pending[0].location).unwrap(),
-        b"payload".as_slice()
+        count_limited
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>(),
+        ids[..2]
     );
-    log.release_from(stream, ["event-1"]).unwrap();
-    assert!(!log.readiness().is_ready(stream));
+
+    stream.release(ids).await.unwrap();
+    log.shutdown().await.unwrap();
 }
 
-#[test]
-fn logical_streams_have_independent_identity_and_rollover() {
+#[tokio::test]
+async fn release_validates_scope_and_future_ids_but_is_idempotent_after_reclaim() {
     let directory = tempfile::tempdir().unwrap();
-    let fast = StreamId::new(11);
-    let slow = StreamId::new(22);
-    let config = Config::new(directory.path())
-        .with_stream_rollover(
-            fast,
-            RolloverPolicy::new(33).with_max_segment_age(Duration::from_secs(1)),
-        )
-        .with_stream_rollover(slow, RolloverPolicy::new(1024 * 1024));
+    let log = Log::open(config(directory.path())).await.unwrap();
+    let stream_id = StreamId::new(27);
+    let stream = log.stream(stream_id);
+    let id = stream
+        .append(Record::new(Bytes::from_static(b"release")))
+        .await
+        .unwrap();
 
-    let mut log = Log::open(config.clone()).unwrap();
-    let fast_old = log
-        .append_to(fast, Record::new("same-id", b"fast-old".as_slice()))
+    let other_stream = log.stream(StreamId::new(28));
+    let other_stream_id = other_stream
+        .append(Record::new(Bytes::from_static(b"other stream")))
+        .await
         .unwrap();
-    let slow_location = log
-        .append_to(slow, Record::new("same-id", b"slow".as_slice()))
-        .unwrap();
-    let fast_active = log
-        .append_to(fast, Record::new("fast-active", b"fast-new".as_slice()))
-        .unwrap();
-    assert_eq!(fast_old.segment_id, 0);
-    assert_eq!(fast_active.segment_id, 1);
-    assert_eq!(slow_location.segment_id, 0);
-    assert_eq!(
-        log.streams().collect::<Vec<_>>(),
-        [DEFAULT_STREAM, fast, slow]
-    );
-    log.release_from(fast, ["same-id"]).unwrap();
-    drop(log);
+    assert!(matches!(
+        stream.release(vec![other_stream_id]).await,
+        Err(Error::RecordIdScopeMismatch {
+            id: rejected,
+            expected_stream,
+        }) if rejected == other_stream_id && expected_stream == stream_id
+    ));
 
-    let log = Log::open(config).unwrap();
-    assert_eq!(
-        log.recovery()
-            .pending_records_for(fast)
-            .iter()
-            .map(|record| record.meta.record_id.as_str())
-            .collect::<Vec<_>>(),
-        ["fast-active"]
-    );
-    assert_eq!(
-        log.recovery().pending_records_for(slow)[0].meta.record_id,
-        "same-id"
-    );
-    assert_eq!(log.read(&slow_location).unwrap(), b"slow".as_slice());
+    let other_directory = tempfile::tempdir().unwrap();
+    let other_log = Log::open(config(other_directory.path())).await.unwrap();
+    let other_root_id = other_log
+        .stream(stream_id)
+        .append(Record::new(Bytes::from_static(b"other root")))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.release(vec![other_root_id]).await,
+        Err(Error::RecordIdScopeMismatch { id: rejected, .. }) if rejected == other_root_id
+    ));
+
+    let mut future_bytes = id.to_bytes();
+    future_bytes[24..].copy_from_slice(&1_u64.to_le_bytes());
+    let future_id = RecordId::from_bytes(future_bytes);
+    assert!(matches!(
+        stream.release(vec![future_id]).await,
+        Err(Error::UnknownRecordId { id: rejected }) if rejected == future_id
+    ));
+
+    stream.release(vec![id, id]).await.unwrap();
+    log.reclaim().await.unwrap();
+    stream.release(vec![id]).await.unwrap();
+    assert_eq!(stream.stats().pending_records, 0);
+
+    other_stream.release(vec![other_stream_id]).await.unwrap();
+    other_log
+        .stream(stream_id)
+        .release(vec![other_root_id])
+        .await
+        .unwrap();
+    other_log.shutdown().await.unwrap();
+    log.shutdown().await.unwrap();
+}
+
+fn bounded_config(root: &std::path::Path, when_full: FullPolicy) -> Config {
+    Config::new(
+        root,
+        Capacity::Bounded {
+            total_bytes: 12 * 1024,
+            when_full,
+        },
+    )
+    .with_max_epoch_bytes(2 * 1024)
+    .with_segment_bytes(4 * 1024)
+    .with_max_release_records(64)
+    .with_max_commit_bytes(4 * 1024)
+}
+
+#[tokio::test]
+async fn bounded_reject_and_block_preserve_existing_pending_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let stream_id = StreamId::new(31);
+    let mut ids = Vec::new();
+    {
+        let log = Log::open(bounded_config(directory.path(), FullPolicy::RejectNew))
+            .await
+            .unwrap();
+        let stream = log.stream(stream_id);
+        loop {
+            match stream
+                .append(Record::new(Bytes::from(vec![0x5a; 512])))
+                .await
+            {
+                Ok(id) => ids.push(id),
+                Err(Error::RejectedCapacity { .. }) => break,
+                Err(error) => panic!("unexpected bounded append error: {error}"),
+            }
+        }
+        assert!(!ids.is_empty());
+        assert_eq!(stream.stats().pending_records, ids.len() as u64);
+        assert!(log.stats().actual_file_bytes <= 12 * 1024);
+        log.shutdown().await.unwrap();
+    }
+
+    let log = Log::open(bounded_config(directory.path(), FullPolicy::Block))
+        .await
+        .unwrap();
+    let stream = log.stream(stream_id);
+    let blocked_stream = stream.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let admitted_before = log.stats().admitted_operations;
+    let blocked = tokio::spawn(async move {
+        started_tx.send(()).unwrap();
+        blocked_stream
+            .append(Record::new(Bytes::from(vec![0x33; 512])))
+            .await
+    });
+    started_rx.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = log.stats();
+            if stats.admitted_operations > admitted_before && stats.admission_waiters > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("append did not reach the capacity wait");
+    let blocked_admissions = log.stats().admitted_operations;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(log.stats().admitted_operations, blocked_admissions);
+
+    stream.release(ids).await.unwrap();
+    let admitted = tokio::time::timeout(Duration::from_secs(5), blocked)
+        .await
+        .expect("blocked append did not resume after capacity was reclaimed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stream.stats().pending_records, 1);
+    stream.release(vec![admitted]).await.unwrap();
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_block_rejects_an_append_that_can_never_fit() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::new(
+        directory.path(),
+        Capacity::Bounded {
+            total_bytes: 600,
+            when_full: FullPolicy::Block,
+        },
+    )
+    .with_max_epoch_bytes(1_024)
+    .with_segment_bytes(2_048)
+    .with_max_release_records(8)
+    .with_max_commit_bytes(1_024);
+    let log = Log::open(config).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        log.stream(StreamId::new(37))
+            .append(Record::new(Bytes::from_static(b"cannot fit"))),
+    )
+    .await
+    .expect("an impossible append waited under Block");
+    assert!(matches!(result, Err(Error::ExceedsCapacity { .. })));
+    log.shutdown().await.unwrap();
 }

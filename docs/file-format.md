@@ -1,546 +1,750 @@
 # Camus file format version 1
 
 This document is the normative byte-level specification for Camus on-disk
-format version 1. It defines canonical paths, frame layouts, checksum inputs,
-manifest schemas, validation rules, and the boundary between repair and
-corruption.
+format version 1. It defines canonical paths, packed layouts, checksum inputs,
+codecs, validation rules, and the compatibility boundary.
 
-The [architecture](architecture.md) remains authoritative for publication
-ordering, durability, recovery, release, and reclamation. The
-[README](../README.md) remains authoritative for the public project boundary
-and API contract. If the documents appear to disagree, this document governs
-byte encoding and the architecture governs state transitions and filesystem
-ordering.
+The [architecture](architecture.md) is authoritative for filesystem ordering,
+durability, recovery, release, and reclamation. The
+[README](../README.md) is authoritative for the public project and API
+boundary. If the documents appear to disagree, this document governs bytes and
+the architecture governs state transitions.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. Byte
 ranges use half-open notation: `[a, b)` includes `a` and excludes `b`.
 
-## Design constraints
+## Format boundary
 
-Version 1 is designed around five properties:
+Format v1 encodes:
 
-- one append call becomes one atomic, stream-local recovery epoch;
-- payloads can remain unread during recovery;
-- segment lifecycle and releases survive process crashes;
-- only a physically final torn or checksum-damaged tail can be repaired
-  automatically; and
-- unsupported or ambiguous authoritative data fails closed.
+- one immutable 128-bit root identity;
+- root-wide physical data segments;
+- logical stream IDs and stream-local record sequence intervals;
+- exact opaque metadata and payload bytes;
+- append-epoch recovery boundaries;
+- exact record-level release state;
+- segment seal and removal state; and
+- durable stream sequence high-waters.
 
-The format does not encode consumer ownership, delivery attempts, application
-schemas, cross-stream ordering, compression, encryption, or authentication.
-Record metadata and payload bytes are opaque to Camus.
+It does not encode consumer identity, attempts, subscriptions, claims,
+application schemas, cross-stream ordering, compression, encryption, or
+authentication.
 
-## Encoding conventions and limits
+This target v1 directly replaces the repository's earlier unpublished format.
+There is no migration or compatibility requirement for those old bytes. Once
+this target is published, the compatibility rules at the end of this document
+apply.
 
-All unsigned integers are little-endian. Frames are packed without alignment
-or padding. Lengths include exactly the byte ranges stated below.
+## Primitive encoding
 
-Every checksum is unseeded XXH3-64. A stored checksum is the resulting `u64`
-encoded little-endian. For multiple inputs, `XXH3(a || b)` means one streaming
-hash over the exact concatenation of `a` followed by `b`; it is not a hash of
-separate digests. XXH3 detects accidental corruption but provides no
-cryptographic authenticity.
+All integers are unsigned and little-endian. Structures are packed exactly as
+shown with no alignment bytes or padding. Every length and offset calculation
+MUST use checked `u64` arithmetic. Overflow is corruption, never wraparound.
 
-Version 1 enforces these limits before allocating or interpreting variable
-data:
+`RootId` is an opaque 16-byte value stored and copied verbatim. It has no UUID
+field-endianness interpretation.
 
-| Item | Limit |
-| --- | ---: |
-| File header | 32 bytes |
-| Segment frame prefix | 48 bytes |
-| Manifest frame prefix | 32 bytes |
-| Segment or manifest frame metadata | 16,777,216 bytes |
-| Record ID | 1 to 16,384 UTF-8 bytes |
-| Segment IDs emitted in one removal event | 65,536 |
+Every checksum and digest is seeded XXH3-64. The fixed format-v1 seed is:
 
-The removal-event limit is a canonical writer bound: larger removal sets are
-split into consecutive events. A reader is still bounded by the 16 MiB
-metadata limit. Every length addition and file-offset addition MUST fit in a
-`u64`; overflow is corruption, not wraparound.
+```text
+u64::from_le_bytes(*b"CAMUSV1!") = 0x21315653554d4143
+```
+
+The seed is implied by v1, is not stored, is not configurable, and is not
+secret. A checksum value is encoded as a little-endian `u64`. In this document,
+`H(bytes)` means seeded XXH3-64 over exactly `bytes`; `H(a || b)` means one
+streaming hash over the exact concatenation, not a hash of separate digests.
+
+XXH3 detects accidental corruption. It is not a MAC and does not protect
+against deliberate modification by an actor who can recompute checksums.
+
+Versioned eight-byte magics fix the size and interpretation of every structure
+that follows them. Except for the root superblock's explicit format version,
+v1 structures contain no redundant version, flags, reserved fields, or header
+lengths.
+
+## Validation and configured limits
+
+Readers MUST validate a fixed prefix and its checksum before trusting a length
+from that prefix. A declared variable region MUST fit exactly within its
+validated enclosing file or structure. Readers SHOULD stream or skip large
+regions rather than allocate from an unchecked length.
+
+`max_epoch_bytes`, `max_release_records`, `max_commit_bytes`, and
+`segment_bytes` are writer/admission bounds, not stored format fields. Lowering
+a bound when reopening does not make already durable larger units corrupt;
+recovery validates them from their enclosing file lengths and checksums. The
+new bound applies to future operations. Root capacity is separately validated
+at open as specified by the architecture.
+
+Canonical writers enforce these configuration relationships:
+
+```text
+segment_bytes >= 48 + max_epoch_bytes + 48
+max_commit_bytes >= max(
+  max_epoch_bytes,
+  largest Release frame produced by max_release_records
+)
+```
+
+The first expression reserves both the segment header and seal footer around
+one maximum epoch. All arithmetic MUST be checked.
 
 ## Canonical root layout
 
 ```text
 <root>/
+  ROOT
   camus.lock
-  MANIFEST
+  MANIFEST.chk
+  MANIFEST.log
   segments/
     segment-00000000000000000000.log
     ...
-  streams/
-    stream-0000000007/
-      segment-00000000000000000000.log
-      ...
 ```
 
-Logical stream `0` uses `segments/`. Logical streams `1..=u32::MAX` use
-`streams/stream-<stream-id>`, where the ID is zero-padded to 10 decimal digits.
-Segment names contain a zero-padded 20-digit decimal `u64` segment ID.
+Segment names contain a zero-padded 20-digit decimal physical segment ID.
+Canonical writers allocate IDs monotonically from zero. `u64::MAX` is reserved
+as the exhausted `next_segment_id` sentinel and MUST NOT appear in a segment
+file name, segment header, or manifest lifecycle body.
 
-The following files are transactional implementation artifacts and are not
-additional sources of state:
+The recognized transactional names are:
 
-- `MANIFEST.create` while creating the first manifest;
-- `MANIFEST.compact` while writing a manifest checkpoint; and
-- `segment-<20-digit-id>.log.tmp` while creating a segment.
+- `ROOT.tmp`;
+- `MANIFEST.chk.tmp`;
+- `MANIFEST.log.tmp`; and
+- `segments/segment-<20-digit-id>.log.tmp`.
 
-`camus.lock` establishes exclusive process ownership but has no version-1 wire
-payload. `MANIFEST` is authoritative for which canonical segment files exist
-and whether each is active or sealed. Directory enumeration is reconciliation
-input only.
+They are publication artifacts, not independent state sources. No other file
+name is part of format v1. `camus.lock` provides process ownership and has no
+versioned payload.
 
-## Shared file header
+## Root superblock
 
-Every segment and manifest starts with this 32-byte header:
+`ROOT` is exactly 40 bytes:
 
 | Offset | Size | Field | Validation |
 | ---: | ---: | --- | --- |
-| 0 | 8 | `magic` | Exact file-type magic |
-| 8 | 2 | `version` | `1` |
-| 10 | 2 | `header_len` | `32` |
-| 12 | 4 | `owner` | File-type-specific |
-| 16 | 8 | `sequence` | File-type-specific |
-| 24 | 8 | `header_checksum` | `XXH3(header[0..24])` |
+| 0 | 8 | `magic` | ASCII `CAMROOT1` |
+| 8 | 8 | `format_version` | Exactly `1` |
+| 16 | 16 | `root_id` | Opaque random bytes |
+| 32 | 8 | `superblock_checksum` | `H(ROOT[0..32])` |
 
-The header checksum covers the magic, version, length, owner, and sequence.
-An incomplete header, checksum mismatch, unsupported version, or invalid
-file-type interpretation is authoritative corruption and MUST NOT be repaired.
+Trailing bytes, an incomplete superblock, an unsupported version, or a
+checksum failure are authoritative corruption. Recovery MUST NOT synthesize a
+replacement `RootId` for an existing root.
 
-### Segment header interpretation
+Creation writes the complete bytes to `ROOT.tmp`, syncs the file, atomically
+renames it to `ROOT`, and syncs the root directory. A complete filesystem copy
+therefore retains the same root identity.
 
-- `magic` is ASCII `CAMSEG01` (`43 41 4d 53 45 47 30 31`).
-- `owner` is the logical stream ID as a `u32`.
-- `sequence` is the segment ID as a `u64`.
-- Both values MUST match the manifest state and canonical path used to open the
-  file.
+## Public RecordId serialization
 
-Version 1 uses the historical term `shard_id` for this stream ID in some
-manifest JSON. There is no distinct physical-shard namespace.
-
-### Manifest header interpretation
-
-- `magic` is ASCII `CAMMAN01` (`43 41 4d 4d 41 4e 30 31`).
-- `(owner, sequence) = (0, 0)` identifies an ordinary event-log manifest.
-- `owner > 0` identifies a checkpoint manifest. If it contains `N` checkpoint
-  frames, `owner = N + 1` and `sequence` is the checkpoint descriptor checksum
-  defined below.
-
-The `+1` encoding reserves owner `0` for the ordinary manifest. An empty
-checkpoint therefore has owner `1`, and its sequence is XXH3-64 of the empty
-byte string. Because `owner` is a `u32`, `N` cannot exceed
-`u32::MAX - 1`.
-
-## Segment files
-
-The canonical committed grammar is:
-
-```text
-segment = file_header epoch*
-epoch   = record_frame+ epoch_commit_frame
-```
-
-An active file may physically end with an incomplete or uncommitted epoch
-after a crash. A sealed file MUST match the committed grammar exactly. Epochs
-never cross a segment boundary or logical-stream boundary.
-
-### Segment frame prefix
-
-Every record and epoch-commit frame starts with this 48-byte prefix:
-
-| Offset | Size | Field | Validation |
-| ---: | ---: | --- | --- |
-| 0 | 8 | `magic` | ASCII `CAMREC01` |
-| 8 | 2 | `version` | `1` |
-| 10 | 1 | `kind` | `1` or `2` |
-| 11 | 1 | `flags` | `0` |
-| 12 | 4 | `metadata_len` | Little-endian `u32`, at most 16 MiB |
-| 16 | 8 | `payload_len` | Little-endian `u64` |
-| 24 | 8 | `frame_len` | `48 + metadata_len + payload_len` |
-| 32 | 8 | `payload_checksum` | Kind-specific |
-| 40 | 8 | `descriptor_checksum` | `XXH3(prefix[0..40] || metadata)` |
-
-The physical frame is:
-
-```text
-48-byte prefix || metadata[metadata_len] || payload[payload_len]
-```
-
-The component lengths and redundant `frame_len` MUST agree. The descriptor
-checksum binds all prefix fields, including `payload_checksum`, plus the exact
-metadata bytes. It deliberately does not read the payload bytes.
-
-### Kind 1: record
-
-For a record frame, `payload_checksum` MUST equal `XXH3(payload)`, including
-for an empty payload. Its metadata is encoded as:
+Although individual records do not store a complete ID, the public opaque
+token has this fixed 32-byte serialization:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
-| 0 | 4 | `record_id_len`, little-endian `u32` |
-| 4 | `record_id_len` | Non-empty UTF-8 record ID |
-| `4 + record_id_len` | Remaining bytes | Opaque caller metadata |
+| 0 | 16 | `root_id`, verbatim |
+| 16 | 8 | `stream_id`, little-endian `u64` |
+| 24 | 8 | `sequence`, little-endian `u64` |
 
-The complete metadata area, including the four-byte ID length, MUST not exceed
-16 MiB. A record ID MUST not exceed 16,384 UTF-8 bytes.
+There is no token checksum. Root and stream scope plus durable sequence state
+are validated before an operation using the token is admitted. The numeric
+components are not a physical address or public ordering API.
 
-Record IDs are scoped by logical stream. The public format contract requires a
-producer never to reuse an ID during that stream's lifetime, even after
-release or reclamation. Recovery rejects duplicate IDs among the segment files
-still represented by the manifest; it cannot prove uniqueness against history
-that has already been reclaimed.
+## Data segment grammar
 
-### Kind 2: epoch commit
+A canonical segment is either active or sealed:
 
-An epoch-commit frame has these fixed fields:
+```text
+active_segment = SegmentHeader Epoch+
+sealed_segment = SegmentHeader Epoch+ SegmentFooter
 
-- `metadata_len = 24`;
-- `payload_len = 0`;
-- `frame_len = 72`; and
-- `payload_checksum = 0`.
+Epoch = EpochHeader Record+ EpochCommit
+Record = RecordDescriptor Metadata Payload
+```
 
-Its metadata is:
+Segments are root-wide and may contain epochs for different logical streams.
+Every canonical segment contains at least one complete epoch. A segment with
+only a header is invalid. Epochs and append commit groups never cross segment
+files.
+
+### SegmentHeader
+
+Every segment begins with this 48-byte header:
 
 | Offset | Size | Field | Validation |
 | ---: | ---: | --- | --- |
-| 0 | 8 | `epoch_start` | Absolute offset of the epoch's first record prefix |
-| 8 | 8 | `frame_count` | Number of record frames; greater than zero |
-| 16 | 8 | `descriptors_checksum` | See below |
+| 0 | 8 | `magic` | ASCII `CAMSEG01` |
+| 8 | 16 | `root_id` | Must equal `ROOT.root_id` |
+| 24 | 8 | `segment_id` | Must equal canonical file name; not `u64::MAX` |
+| 32 | 8 | `created_at_unix_millis` | Persisted age baseline |
+| 40 | 8 | `header_checksum` | `H(header[0..40])` |
 
-`descriptors_checksum` is XXH3-64 over the complete 48-byte prefixes of the
-epoch's kind-1 record frames in physical order:
+`created_at_unix_millis` is the wall-clock baseline captured for the segment's
+first append group. It has rollover-policy meaning only; it is not a record
+timestamp.
+
+### RecordDescriptor
+
+Every record begins with this 40-byte descriptor:
+
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `metadata_len` | Opaque metadata byte length |
+| 8 | 8 | `payload_len` | Opaque payload byte length |
+| 16 | 8 | `metadata_checksum` | `H(metadata)` |
+| 24 | 8 | `payload_checksum` | `H(payload)` |
+| 32 | 8 | `descriptor_checksum` | `H(descriptor[0..32])` |
+
+The exact encoded record is:
 
 ```text
-XXH3(record_prefix_1 || ... || record_prefix_N)
+40-byte descriptor
+metadata[metadata_len]
+payload[payload_len]
 ```
 
-It excludes the commit prefix. The commit frame's own
-`descriptor_checksum` still protects its 24 metadata bytes. `epoch_start`
-MUST equal the offset immediately after the file header or previous valid
-commit frame, and `frame_count` MUST equal the exact number of pending record
-frames.
+Metadata and payload MAY be empty; their checksum is still the seeded hash of
+the empty byte string. Complete record length is derived as
+`40 + metadata_len + payload_len`. There is no record magic, kind, ID, total
+length, or padding. The enclosing epoch provides those boundaries and logical
+identity.
 
-### Segment recovery and lazy payload validation
+### EpochHeader
 
-Recovery scans from offset 32, validates each prefix and its metadata, and
-accumulates record descriptors without loading or hashing payloads. It
-publishes accumulated records only after a valid matching epoch commit. On a
-lazy `read` or `read_many`, Camus revalidates the segment header, frame prefix,
-metadata checksum and metadata encoding, verifies that the supplied physical
-location matches the descriptor, reads the payload, and checks
-`payload_checksum`.
+Each append request starts with this 48-byte header:
 
-Consequently, payload corruption is reported when that payload is read. It is
-not treated as a repairable active tail during open.
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `magic` | ASCII `CAMEPH01` |
+| 8 | 8 | `stream_id` | Any `u64` value |
+| 16 | 8 | `first_sequence` | First record identity in this epoch |
+| 24 | 8 | `record_count` | Greater than zero |
+| 32 | 8 | `records_bytes` | Exact sum of complete encoded records |
+| 40 | 8 | `header_checksum` | `H(header[0..40])` |
 
-The repair boundary is intentionally narrow:
+`first_sequence + record_count - 1` MUST fit in `u64`. Record ordinal `i`
+within the epoch has sequence `first_sequence + i`. Intervals for one stream
+MUST be strictly increasing and nonoverlapping in physical append order.
+Before allocating a record index, a reader MUST also prove with checked
+arithmetic that `records_bytes >= 40 * record_count` and that the declared
+epoch boundary fits its enclosing segment.
+Contiguous allocation relative to checkpoint and removal state is validated as
+specified under checkpoint and log replay. A stream with no earlier durable
+identity starts at sequence zero.
 
-| Condition | Active segment's final epoch | Sealed segment or earlier epoch |
+`records_bytes` MUST equal the checked sum of all 40-byte descriptors and their
+declared opaque bodies. It does not include either epoch envelope.
+
+### EpochCommit
+
+Each epoch ends with this 40-byte commit:
+
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `magic` | ASCII `CAMCMT01` |
+| 8 | 8 | `epoch_start` | Absolute segment offset of its `EpochHeader` |
+| 16 | 8 | `epoch_bytes` | Header, records, and commit |
+| 24 | 8 | `epoch_digest` | Defined below |
+| 32 | 8 | `commit_checksum` | `H(commit[0..32])` |
+
+The redundant length MUST satisfy:
+
+```text
+epoch_bytes = 48 + records_bytes + 40
+```
+
+The commit MUST begin exactly at `epoch_start + 48 + records_bytes`, and the
+next structure MUST begin exactly at `epoch_start + epoch_bytes`.
+
+Let `D1..Dn` be the exact 40-byte record descriptors in physical order. The
+epoch digest is:
+
+```text
+H(complete 48-byte EpochHeader || D1 || ... || Dn)
+```
+
+Each descriptor binds its stored metadata and payload checksums, so the epoch
+digest transitively binds body integrity without reading body bytes during
+structural recovery.
+
+A record becomes recoverable only as part of a complete valid epoch. An
+uncommitted body never advances sequence high-water.
+
+### SegmentFooter
+
+A sealed segment ends with this 48-byte footer:
+
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `magic` | ASCII `CAMSEA01` |
+| 8 | 8 | `segment_id` | Must equal header and canonical name |
+| 16 | 8 | `segment_bytes` | Exact complete file length including footer |
+| 24 | 8 | `epoch_count` | Exact number of epochs; greater than zero |
+| 32 | 8 | `segment_digest` | Defined below |
+| 40 | 8 | `footer_checksum` | `H(footer[0..40])` |
+
+Let `C1..Cn` be the exact 40-byte `EpochCommit` structures in physical order.
+The segment digest is:
+
+```text
+H(complete 48-byte SegmentHeader || C1 || ... || Cn)
+```
+
+`segment_bytes` MUST equal actual file length, and the footer MUST begin at
+`segment_bytes - 48`. No bytes may follow it. A valid footer makes the file
+physically immutable. Manifest state determines whether the completed seal has
+been published logically.
+
+## Structural segment validation
+
+Normal open validates the segment header, epoch headers, every record
+descriptor, epoch commits, and any footer. It uses checked lengths to skip
+metadata and payload without hashing them. It MUST still prove that every body
+range fits before the predicted commit and file boundary.
+
+When a pending record is read, Camus revalidates its structural location, reads
+the complete metadata and payload, and checks both stored body checksums before
+returning either. A body mismatch is authoritative corruption of a committed
+epoch. It is never repaired by truncation.
+
+The active-tail repair boundary is exact:
+
+| Condition | Manifest-active final segment | Sealed or earlier segment |
 | --- | --- | --- |
-| Incomplete prefix or frame | Truncate to `epoch_start` and sync | Fail closed |
-| Invalid prefix, inconsistent length, or descriptor checksum | Truncate only if no later valid commit exists; then sync | Fail closed |
-| EOF after complete records but before their commit | Truncate to `epoch_start` and sync | Fail closed |
-| Checksum-valid unknown kind, invalid record metadata, or invalid commit semantics | Fail closed | Fail closed |
-| Invalid file header | Fail closed | Fail closed |
+| Incomplete final `EpochHeader` | Truncate to its start; sync | Fail closed |
+| Valid header but incomplete final descriptor or body | Truncate to epoch start; sync | Fail closed |
+| Complete records but incomplete/missing final commit | Truncate to epoch start; sync | Fail closed |
+| Incomplete trailing footer after complete epochs | Truncate to prior commit end; sync | Fail closed |
+| Complete structure with bad checksum, digest, length, magic, or semantics | Fail closed | Fail closed |
+| Damage before evidence of a later valid structure | Fail closed | Fail closed |
+| Invalid authoritative segment header | Fail closed | Fail closed |
 
-Recovery may scan for evidence of a valid later commit to distinguish a torn
-tail from corruption before a suffix. It MUST NOT use that scan to skip bytes,
-reorder frames, or salvage a later epoch.
+Repair never publishes a partial epoch and never searches past damage to
+salvage later bytes. A complete valid footer without matching
+`SegmentSealed` state is not damage; recovery completes that manifest
+publication as specified by the architecture.
 
-## Manifest file
+## Manifest log
 
-The manifest stores stream and segment lifecycle, persisted segment creation
-times, and stream-scoped release markers. It contains the shared header
-followed by zero or more 32-byte-prefixed events.
+`MANIFEST.log` contains a fixed header followed by zero or more atomic frames:
 
-### Manifest frame prefix
+```text
+ManifestLogHeader ManifestFrame*
+```
+
+### ManifestLogHeader
+
+The header is 40 bytes:
 
 | Offset | Size | Field | Validation |
 | ---: | ---: | --- | --- |
-| 0 | 8 | `magic` | ASCII `CAMMRC01` |
-| 8 | 2 | `version` | `1` |
-| 10 | 1 | `kind` | `1..=6` as defined below |
-| 11 | 1 | `flags` | `0` |
-| 12 | 4 | `metadata_len` | Little-endian `u32`, at most 16 MiB |
-| 16 | 8 | `frame_len` | `32 + metadata_len` |
-| 24 | 8 | `frame_checksum` | `XXH3(prefix[0..24] || metadata)` |
+| 0 | 8 | `magic` | ASCII `CAMLOG01` |
+| 8 | 16 | `root_id` | Must equal `ROOT.root_id` |
+| 24 | 8 | `base_seq` | Sequence expected for the first frame |
+| 32 | 8 | `header_checksum` | `H(header[0..32])` |
 
-The physical frame is `32-byte prefix || metadata[metadata_len]`. Manifest
-frames have no payload. The redundant total and component lengths MUST agree.
+The initial empty log has `base_seq = 1`. A fresh log published after a
+checkpoint normally uses `last_applied_seq + 1`. When sequence space is
+exhausted, no further manifest mutation may be written.
 
-### JSON metadata rules
+If frames are present, the first frame's `manifest_seq` MUST equal `base_seq`
+and every subsequent value MUST be exactly one greater. Replay relative to a
+checkpoint is defined below.
 
-Manifest metadata is a UTF-8 JSON object. Canonical Camus writers emit compact
-JSON without insignificant whitespace and use the field order shown below.
-Readers treat object-member order and insignificant whitespace as
-non-semantic, but MUST reject malformed JSON, duplicate fields, unknown
-fields, missing required fields, incorrect JSON types, and integers outside
-the target unsigned range. `created_at_unix_millis`, where present, is Unix
-time in whole milliseconds stored as a `u64`.
+### ManifestFrameHeader
 
-The event kinds are:
+Every frame uses this 48-byte header followed immediately by its body:
 
-| Kind | Name | Checkpoint | Event-log suffix |
-| ---: | --- | :---: | :---: |
-| 1 | Default-stream release | Yes | Yes |
-| 2 | Segment rotation | No | Yes |
-| 3 | Segment removal | No | Yes |
-| 4 | Segment snapshot | Yes | No |
-| 5 | Segment timestamp | No | Yes |
-| 6 | Nondefault-stream release | Yes | Yes |
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `magic` | ASCII `CAMCTL01` |
+| 8 | 8 | `manifest_seq` | Strict nonzero root-wide sequence |
+| 16 | 8 | `kind` | Exactly `1`, `2`, or `3` |
+| 24 | 8 | `body_len` | Exact kind-specific body length |
+| 32 | 8 | `body_checksum` | `H(body)` |
+| 40 | 8 | `header_checksum` | `H(header[0..40])` |
 
-#### Kind 1: default-stream release
+Complete frame length is `48 + body_len`. There is no repeated length or
+padding. The header checksum MUST validate before `body_len` is trusted. The
+body checksum MUST validate before kind-specific fields are applied.
 
-```json
-{"record_ids":["id"]}
-```
+### Kind 1: Release
 
-`record_ids` is a non-empty array of unique, valid record IDs. The default
-stream must already be declared. Repeating an ID in a later release event is
-semantically idempotent.
-
-#### Kind 2: segment rotation
-
-```json
-{"shard_id":7,"previous_segment_id":9,"new_segment_id":10,"created_at_unix_millis":123}
-```
-
-The canonical field order is `shard_id`, `previous_segment_id`,
-`new_segment_id`, then optional `created_at_unix_millis`. `shard_id` is the
-logical stream ID.
-
-- Stream initialization uses `previous_segment_id: null`, requires an empty
-  segment set, and requires `new_segment_id: 0`.
-- Later rotation requires `previous_segment_id` to name the active segment and
-  `new_segment_id = previous_segment_id + 1`.
-- Applying the event seals the previous segment and makes the new segment the
-  sole active segment.
-- Current writers include `created_at_unix_millis`. Readers accept its absence
-  for early version-1 roots.
-
-#### Kind 3: segment removal
-
-```json
-{"shard_id":7,"segment_ids":[1,2]}
-```
-
-`segment_ids` is non-empty and contains no duplicates. Every listed segment
-must exist in `shard_id` and be sealed. The active segment cannot be removed.
-Canonical writers split more than 65,536 IDs into consecutive removal events.
-
-#### Kind 4: segment snapshot
-
-```json
-{"shard_id":0,"segment_id":9,"lifecycle":"Sealed"}
-```
-
-The canonical field order is `shard_id`, `segment_id`, `lifecycle`, then
-optional `created_at_unix_millis`. `lifecycle` is exactly `"Active"` or
-`"Sealed"`. Each `(shard_id, segment_id)` pair may occur only once in a
-checkpoint. A snapshot outside the checkpoint prefix is corruption.
-
-#### Kind 5: segment timestamp
-
-```json
-{"shard_id":7,"segment_id":9,"created_at_unix_millis":123}
-```
-
-The segment must already exist, and no creation timestamp may already be
-recorded for it.
-
-#### Kind 6: nondefault-stream release
-
-```json
-{"stream_id":7,"record_ids":["id"]}
-```
-
-`stream_id` must be nonzero and already declared. `record_ids` follows the
-same rules as kind 1. The distinct event preserves compatibility with the
-original stream-0 release encoding.
-
-### Manifest state invariants
-
-Events are applied in physical order. A valid resulting manifest state MUST
-satisfy all of these rules:
-
-- every declared stream has exactly one active segment;
-- that active segment has the greatest retained segment ID in its stream;
-- initialization and rotation allocate contiguous IDs, although removal of
-  sealed segments may leave gaps in a later checkpoint;
-- a timestamp references a retained segment and is assigned at most once;
-- default-stream releases use kind 1, while nondefault releases use kind 6;
-  and
-- release state never references an undeclared stream.
-
-The manifest records lifecycle and release state, not application-level
-delivery facts. Public APIs validate that released IDs are known before
-writing, while the wire transition itself only requires a valid ID and a
-declared stream.
-
-### Checkpoint manifests
-
-For a checkpoint header, let `N = owner - 1`. Exactly the first `N` manifest
-frames after the header form the checkpoint. Only kinds 1, 4, and 6 are valid
-there. The checkpoint descriptor checksum is:
+All fields are `u64`:
 
 ```text
-XXH3(checkpoint_prefix_1 || ... || checkpoint_prefix_N)
+offset  size  field
+0       8     stream_id
+8       8     released_count
+16      8     range_count
+24      16*N  ranges[N] = { start, len }
 ```
 
-Each input is the complete 32-byte frame prefix. Metadata is bound
-transitively through each prefix's `frame_checksum`. The result MUST equal the
-header `sequence`. After all `N` frames are applied, the checkpoint MUST form a
-complete state satisfying the manifest invariants before any ordinary suffix
-event is accepted.
+The exact body length is `24 + 16 * range_count`. `released_count` and
+`range_count` are greater than zero. A range represents sequences
+`start..=start + len - 1`; `len` is nonzero and its end MUST fit in `u64`.
 
-Canonical checkpoints use this deterministic order:
+Ranges are sorted by `start`, nonoverlapping, nonadjacent, and therefore
+maximally coalesced. The checked sum of every `len` equals
+`released_count`. Every represented ID belongs to `stream_id`, was durable by
+that replay point, and was pending immediately before this frame. Empty or
+all-no-op release requests do not write a frame.
 
-1. segment snapshots sorted by numeric stream ID and then segment ID;
-2. default-stream release IDs in UTF-8 byte order, one ID per event; and
-3. nondefault streams in numeric order, then their release IDs in UTF-8 byte
-   order, one ID per event.
+`max_release_records` limits newly written frames. Recovery MUST accept a
+structurally valid older frame larger than the current writer limit; the body
+length and enclosing file remain the decoding bounds.
 
-Frames after the checkpoint prefix are ordinary event-log suffix events. They
-are not included in the header descriptor checksum.
+### Kind 2: SegmentSealed
 
-### Manifest recovery and repair
+The body is exactly 32 bytes:
 
-The manifest header and complete checkpoint prefix are authoritative and never
-repairable. A checkpoint count mismatch, incomplete checkpoint frame,
-checksum failure, disallowed kind, invalid schema, or invalid completed state
-MUST fail closed.
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | `segment_id` |
+| 8 | 8 | `segment_bytes` |
+| 16 | 8 | `epoch_count` |
+| 24 | 8 | `segment_digest` |
 
-After an ordinary header or complete checkpoint, only a structurally
-incomplete or checksum-damaged final event may be truncated. Redundant lengths
-are used to decide whether a damaged candidate can be the final event. If a
-valid later event can be found after the damaged offset, recovery fails closed
-instead of truncating. A complete checksum-valid event with an unknown kind,
-invalid JSON or field, snapshot in the suffix, or invalid lifecycle transition
-always fails closed. Every manifest truncation is followed by `sync_data`.
+All four fields MUST exactly match the validated `SegmentFooter` of the named
+segment. The segment must previously be manifest-active. Repeating or
+contradicting the transition is corruption.
 
-As with segments, scanning for a later valid frame is corruption evidence, not
-a salvage mechanism.
+### Kind 3: SegmentRemoved
 
-## Filesystem publication protocol
+All fields are `u64`:
 
-Correct bytes are insufficient without the ordering below. The complete
-contract and crash-window rationale are in the
-[architecture](architecture.md).
+```text
+offset  size  field
+0       8     segment_id
+8       8     highwater_count
+16      16*N  highwaters[N] = { stream_id, sequence_highwater }
+```
 
-| Operation | Required publication order |
+The exact body length is `16 + 16 * highwater_count`. The count MAY be zero.
+Entries are sorted by strictly increasing `stream_id` and contain no duplicate
+stream. Each included high-water is the inclusive greatest durable sequence
+that must remain known before deleting this segment's last physical evidence.
+Entries MUST advance previously persisted high-water state; canonical writers
+omit no-op entries.
+
+The named segment must be manifest-sealed and every physical record in it must
+be durably released. Applying the frame makes the segment authoritatively
+absent before its file is deleted. A second removal or removal of an active or
+partly pending segment is corruption.
+
+There is no `SegmentCreated`, `StreamCreated`, or standalone
+`StreamHighWater` frame. A canonical segment file proves creation, complete
+epochs prove stream existence, checkpoints fold high-waters, and removal
+carries the advances required for safe deletion.
+
+## Manifest checkpoint
+
+`MANIFEST.chk` contains one header and one canonical complete-state body:
+
+```text
+CheckpointHeader CheckpointBody
+```
+
+### CheckpointHeader
+
+The header is 56 bytes:
+
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 8 | `magic` | ASCII `CAMCHK01` |
+| 8 | 16 | `root_id` | Must equal `ROOT.root_id` |
+| 24 | 8 | `last_applied_seq` | Greatest manifest sequence represented; initially `0` |
+| 32 | 8 | `body_len` | Exact remaining file length |
+| 40 | 8 | `body_checksum` | `H(body)` |
+| 48 | 8 | `header_checksum` | `H(header[0..48])` |
+
+The complete file length MUST equal `56 + body_len`. The checkpoint header,
+body, and checksum are authoritative and never tail-repaired.
+
+### CheckpointBody prefix
+
+The body begins with three `u64` fields:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | `next_segment_id` |
+| 8 | 8 | `stream_count` |
+| 16 | 8 | `segment_count` |
+
+`next_segment_id` is the next root-wide ID available for allocation. It is
+zero before any segment is published and otherwise strictly greater than every
+segment ID ever published. `u64::MAX` means the physical ID space is exhausted
+and is never itself allocated.
+
+The prefix is followed by exactly `stream_count` high-water entries and then
+exactly `segment_count` variable-length segment entries. No trailing bytes are
+permitted.
+
+### Stream high-water entries
+
+Each entry is 16 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | `stream_id` |
+| 8 | 8 | `sequence_highwater` |
+
+Entries are sorted by strictly increasing `stream_id`. There is exactly one
+entry for every durable-known stream, including streams with no extant data.
+`sequence_highwater` is the inclusive greatest sequence durable by checkpoint
+publication. The presence of the entry distinguishes a stream whose first and
+greatest durable sequence is zero from an unknown stream.
+
+### Segment entries
+
+Each segment entry begins with this 72-byte fixed part:
+
+| Relative offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | `segment_id` |
+| 8 | 8 | `lifecycle` |
+| 16 | 8 | `segment_bytes` |
+| 24 | 8 | `epoch_count` |
+| 32 | 8 | `segment_digest` |
+| 40 | 8 | `record_count` |
+| 48 | 8 | `released_count` |
+| 56 | 8 | `release_encoding` |
+| 64 | 8 | `encoding_unit_count` |
+
+Entries are sorted by strictly increasing `segment_id` and describe every
+extant canonical segment at checkpoint publication.
+
+`lifecycle` is:
+
+| Value | Meaning |
+| ---: | --- |
+| 1 | Active |
+| 2 | Sealed |
+
+At most one entry is active, and it has the greatest extant segment ID. An
+active entry stores zero in all three footer fields: `segment_bytes`,
+`epoch_count`, and `segment_digest`. A sealed entry copies those fields exactly
+from its validated footer.
+
+`record_count` is the number of complete physical records represented by this
+checkpoint for the segment. It is nonzero. A sealed segment must contain
+exactly that count. An active segment may gain later complete epochs; records
+beyond the checkpoint count begin pending and are affected only by later
+manifest frames.
+
+`released_count` is the exact number of released physical ordinals among
+`0..record_count`. The encoding that follows the fixed part represents exactly
+that set.
+
+### Release encoding 1: ranges
+
+`release_encoding = 1`. Each of `encoding_unit_count` units is 16 bytes:
+
+| Relative offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | `start_ordinal` |
+| 8 | 8 | `len` |
+
+Ordinals are zero-based in physical record order within the segment. Ranges
+are nonempty, sorted, disjoint, nonadjacent, and entirely below
+`record_count`. Their checked total equals `released_count`.
+
+Zero released records use range encoding with `encoding_unit_count = 0`.
+
+### Release encoding 2: bitmap
+
+`release_encoding = 2`. Exactly `encoding_unit_count` little-endian `u64`
+words follow, where:
+
+```text
+encoding_unit_count = ceil(record_count / 64)
+```
+
+Bit `j` of word `i`, with the least significant bit numbered zero, represents
+physical ordinal `64 * i + j`. Every unused high bit in the final word is zero.
+The total number of set bits equals `released_count`.
+
+### Canonical release-encoding choice
+
+For a nonempty released set, let `range_count` be the maximally coalesced range
+count and `bitmap_bytes = 8 * ceil(record_count / 64)`. A canonical checkpoint
+uses ranges exactly when:
+
+```text
+16 * range_count <= bitmap_bytes
+```
+
+It uses the bitmap otherwise. The range representation wins a size tie. A
+reader MUST reject a valid-looking but noncanonical choice or noncanonical
+range/bitmap contents.
+
+## Checkpoint and log replay
+
+Recovery validates the checkpoint first, then the manifest-log header and
+every complete frame.
+
+Let `F = checkpoint.last_applied_seq` and `B = log.base_seq`:
+
+- `B` MUST NOT create a gap after `F`;
+- if the log is fresh, `B = F + 1` unless sequence space is exhausted;
+- an old log left by interrupted compaction may begin at or before `F`;
+- frames with sequence at or below `F` are fully validated but not applied
+  again; and
+- the first frame above `F` MUST be `F + 1`, followed by a contiguous suffix.
+
+When `F = u64::MAX`, no newer manifest frame is representable. A newly
+compacted empty log uses `base_seq = u64::MAX` and MUST remain empty.
+
+A frame-sequence gap, reversal, duplicate inside the log, arithmetic overflow,
+or incompatible base is corruption. A checksum-valid frame with an invalid
+state transition is also corruption.
+
+The checkpoint baseline and replayed frames are reconciled with data files:
+
+- checkpoint segment entries describe files extant at checkpoint time;
+- a canonical segment absent from the checkpoint is valid only as a
+  monotonically allocated self-published segment after that checkpoint;
+- `SegmentSealed` must agree with its footer;
+- a `SegmentRemoved` frame permits the canonical file to be absent and makes a
+  leftover file deletable; and
+- a missing segment without durable removal is corruption.
+
+Release state in checkpoint entries addresses the checkpoint record-count
+baseline. Later Release frames address logical sequences and may release both
+baseline records and records appended afterward.
+
+For sequence validation, the first `record_count` physical records of every
+checkpoint segment entry form its checkpoint baseline. That boundary MUST fall
+between complete epochs, never inside one. Every baseline record has a sequence
+at or below its stream's checkpoint high-water. Baseline intervals are
+strictly ordered and nonoverlapping; gaps are permitted because older physical
+segments may already have been removed.
+
+Every epoch wholly after the checkpoint baseline, including every epoch in a
+self-published post-checkpoint segment, advances its stream from the current
+inclusive high-water by exactly one contiguous interval. A replayed
+`SegmentRemoved` high-water may supply that advance when the segment file is
+already absent. No recovered interval may overlap or move behind checkpoint,
+earlier epoch, or removal evidence.
+
+## Manifest tail repair
+
+Only an incomplete final physical frame in `MANIFEST.log` is repairable:
+
+- fewer than 48 bytes remaining at the final frame boundary; or
+- a complete valid frame header whose declared body ends beyond physical EOF.
+
+Recovery truncates such a tail to the preceding complete frame boundary and
+syncs the log before continuing. A complete header with a bad checksum, a
+complete body with a bad checksum, an unknown kind, invalid body length,
+noncanonical body, sequence fault, or invalid transition fails closed. The
+checkpoint and both container headers are never repaired.
+
+## Publication protocols
+
+Correct bytes are insufficient without the following order. A reported
+success requires every listed durability step for that operation.
+
+| Operation | Required order |
 | --- | --- |
-| Create manifest | Write header to `MANIFEST.create`; `sync_data`; rename to `MANIFEST`; sync root directory |
-| Create segment | Write header to `.log.tmp`; `sync_data`; rename to `.log`; sync segment directory |
-| Initialize or rotate stream | Publish the new segment first; append rotation event; `sync_data` manifest |
-| Append epoch | Write every record frame; write one commit frame; perform one segment `sync_data`; only then report success |
-| Release | Append release event; `sync_data` manifest; only then exclude records from pending recovery |
-| Reclaim | Append all required removal events; `sync_data` manifest; delete declared segment files; sync affected segment directories |
-| Compact manifest | Write complete header and checkpoint to `MANIFEST.compact`; `sync_data`; atomic rename over `MANIFEST`; sync root directory |
-| Repair a tail | Truncate only at the permitted boundary; `sync_data` the repaired file |
+| Create root identity | Write complete `ROOT.tmp`; sync file; rename to `ROOT`; sync root directory |
+| Create segment directory | Create `segments/`; sync root directory before publishing any segment |
+| Create initial checkpoint | Write complete `MANIFEST.chk.tmp`; sync file; rename to `MANIFEST.chk`; sync root directory |
+| Create/replace manifest log | Write complete `MANIFEST.log.tmp`; sync file; rename to `MANIFEST.log`; sync root directory |
+| Self-publish segment | Write header and first complete append group to segment `.tmp`, plus footer if immediately sealed; sync file; rename canonical; sync `segments/` |
+| Append group | Write every record and epoch commit; one `sync_data` on the containing segment; only then report covered appends successful |
+| Seal segment | Stop appends; write footer; sync segment; append complete `SegmentSealed`; sync manifest log |
+| Release group | Append every complete `Release` frame; one manifest-log `sync_data`; only then exclude records and report success |
+| Reclaim segment | Append `SegmentRemoved`; sync manifest log; delete canonical segment; sync `segments/` |
+| Compact checkpoint | Write complete checkpoint temp; sync; rename over checkpoint; sync root directory; only then replace manifest log through its own temp/sync/rename/directory-sync sequence |
+| Repair active tail | Truncate only at a permitted boundary; `sync_data` the repaired file |
 
-An I/O error does not prove whether a durability boundary was crossed. After
-an uncertain failure, the open handle is poisoned and the root must be reopened
-so recovered bytes, rather than in-memory assumptions, decide the outcome.
+Root initialization creates and publishes the empty checkpoint and manifest
+log before `open` reports success. The initial checkpoint has
+`last_applied_seq = 0`, `next_segment_id = 0`, and zero stream and segment
+entries; the initial log has `base_seq = 1` and no frames. A recognized partial
+empty-root initialization may be completed only when no canonical segment or
+nonempty manifest state exists. Otherwise missing authoritative artifacts fail
+closed.
+
+An I/O error does not prove whether a durability boundary or rename became
+durable. After a post-admission failure, the open root is poisoned and reopen
+uses recovered bytes as authority.
 
 ## Directory reconciliation
 
-After the manifest validates, every manifest-declared segment MUST exist at
-its canonical path and have a matching authoritative header. A missing
-declared segment fails closed.
+Recovery first distinguishes canonical names from recognized temporary names.
+It MAY remove a recognized temporary file that never became canonical, with
+the required directory sync. A temporary file is never replayed as an
+additional segment, checkpoint, or log.
 
-Temporary segment files and header-only segments left by interrupted creation
-may be removed with the appropriate directory sync. An unmanifested canonical
-tail segment containing bytes beyond its 32-byte header fails closed: those
-bytes might contain a durable epoch whose lifecycle event has an uncertain
-outcome. Segments already excluded by a durable removal event remain removed
-state even if stale directory entries reappear.
+Every canonical artifact MUST have a valid header with the root identity and
+file-name identity required above. Unknown canonical-looking files,
+unexplained segment IDs, duplicate physical identities, and mismatched root IDs
+fail closed.
+
+A canonical segment covered by a durable `SegmentRemoved` frame is logically
+absent even if its directory entry remains; recovery completes deletion and
+syncs `segments/`. Conversely, absence of a checkpoint- or manifest-live
+segment is corruption.
+
+## Capacity accounting implications
+
+The capacity model charges exact current lengths of canonical and recognized
+transactional format files. It therefore includes `ROOT`, both manifest files,
+all segment bytes, and temporary files while they coexist with canonical
+predecessors. It does not charge nonexistent padding between a short footer and
+the configured segment ceiling.
+
+The worst next-checkpoint reserve is derived from the fixed layouts above and
+bitmap release state for every current physical record. The largest next
+manifest-frame reserve is the maximum of:
+
+- `48 + 24 + 16 * max_release_records` for a maximally fragmented Release;
+- `80` bytes for SegmentSealed; and
+- `64 + 16 * stream_count_in_largest_removable_segment` for SegmentRemoved.
+
+The active segment contributes a separate 48-byte footer reserve. These
+derived bytes are part of bounded root capacity but are not stored in the
+format.
 
 ## Compatibility and evolution
 
-Version 1 deliberately reserves no extension behavior that an old reader
-would silently ignore:
+Format v1 has no extension points that an old reader silently ignores:
 
-- both frame `flags` bytes must remain zero;
-- unknown segment or manifest kinds fail closed;
-- unknown manifest JSON fields fail closed; and
-- magic values, field meanings, checksum ranges, canonical JSON field order,
-  and stable vectors are frozen.
+- every magic and structure size is exact;
+- no trailing bytes or padding are accepted;
+- unknown manifest kinds fail closed;
+- noncanonical ranges, bitmaps, counts, and ordering fail closed;
+- checksum algorithms, seeds, and input ranges are fixed; and
+- field semantics and numeric kind/lifecycle/encoding values are fixed.
 
-Therefore a new kind, field, flag, checksum algorithm, compression or
-encryption mode, or changed field interpretation is not a compatible v1
-extension. It requires a new explicitly specified format and an upgrade plan.
-Readers MUST reject unsupported authoritative versions; they MUST NOT guess a
-format or reinterpret bytes in place.
+Changing a magic, layout, checksum algorithm or range, record codec, manifest
+kind, checkpoint field, compression or encryption behavior, or semantic field
+interpretation requires a new explicit format version and upgrade design.
+Readers MUST reject unsupported authoritative versions and MUST NOT guess or
+reinterpret bytes in place.
 
-Opening a root does not silently migrate its format. Any future incompatible
-migration must operate explicitly, preserve a closed-root backup, and define
-both forward and rollback behavior. Crate semantic versions do not implicitly
-change the on-disk format version.
-
-## Stable version-1 vectors
-
-These lowercase hexadecimal vectors are part of the compatibility contract.
-They are also asserted by `version_one_wire_codecs_have_stable_bytes`.
-
-### Segment header
-
-Input: magic `CAMSEG01`, version `1`, stream `7`, segment `9`.
-
-```text
-43414d534547303101002000070000000900000000000000c91e29e7a55c38be
-```
-
-### Record metadata and prefix
-
-Input: record ID `id`, opaque metadata `00 ff`, payload `abc`.
-
-Encoded record metadata:
-
-```text
-02000000696400ff
-```
-
-The 48-byte record prefix (`payload_len = 3`, `frame_len = 59`) is:
-
-```text
-43414d5245433031010001000800000003000000000000003b0000000000000050392f89945faf789e9d7293d6a7e623
-```
-
-The complete record frame is that prefix followed by metadata
-`02000000696400ff` and payload `616263`.
-
-### Epoch-commit metadata
-
-Input: `epoch_start = 32`, `frame_count = 1`, and
-`descriptors_checksum = 0x0102030405060708`.
-
-```text
-200000000000000001000000000000000807060504030201
-```
-
-### Manifest release prefix
-
-Canonical metadata:
-
-```text
-{"record_ids":["id"]}
-```
-
-Its kind-1 manifest prefix is:
-
-```text
-43414d4d52433031010001001500000035000000000000000b9fe05cff160f8e
-```
+Opening a root never silently migrates its format. Crate semantic versions do
+not implicitly change the on-disk version.
 
 ## Conformance checklist
 
-A version-1 implementation is not conforming unless it:
+A format-v1 implementation is not conforming unless it:
 
-- uses checked arithmetic and enforces metadata bounds before allocation;
-- validates every redundant length and exact checksum input range;
-- publishes records only after a matching epoch commit;
+- uses checked arithmetic for every length, count, sequence, and offset;
+- validates a fixed checksum before trusting its variable length;
 - preserves opaque metadata and payload bytes exactly;
-- validates all manifest schemas and lifecycle transitions;
-- never repairs an authoritative header, sealed segment, checkpoint, semantic
-  error, or damage before a valid suffix;
-- follows the filesystem sync and rename ordering above; and
-- keeps the stable vectors byte-for-byte unchanged.
+- publishes records only from complete valid epochs;
+- assigns contiguous stream-local sequences without reuse;
+- verifies opaque bodies before returning them;
+- applies exact release state and canonical range/bitmap codecs;
+- validates root identity, manifest sequence fencing, and every lifecycle
+  transition;
+- never repairs a complete corrupt structure, authoritative header,
+  checkpoint, sealed segment, or damage before a valid suffix;
+- follows every file and directory sync ordering above; and
+- fails closed rather than inventing state for an ambiguous artifact.

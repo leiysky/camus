@@ -21,6 +21,6 @@ jobs:
       - name: cargo-fuzz
         run: cargo +nightly-2026-04-02 install cargo-fuzz --locked --version 0.13.2
       - name: Segment recovery fuzzing
-        run: cargo +nightly-2026-04-02 fuzz run wal_recovery -- -max_total_time=60 -timeout=5
+        run: cargo +nightly-2026-04-02 fuzz run segment_recovery -- -max_total_time=60 -timeout=5
       - name: Manifest recovery fuzzing
         run: cargo +nightly-2026-04-02 fuzz run manifest_recovery -- -max_total_time=60 -timeout=5

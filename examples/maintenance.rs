@@ -1,51 +1,42 @@
-//! Run application-scheduled rollover and reclamation, and distinguish
-//! ordinary maintenance from explicit storage-pressure reclamation.
+//! Configure a bounded root and request an explicit maintenance pass.
 
-use camus::{Config, Log, ReclaimReport, Record, Result, StreamId, DEFAULT_STREAM};
-use std::time::Duration;
+use bytes::Bytes;
+use camus::{Capacity, Config, FullPolicy, Log, ReadLimits, Record, Result, StreamId};
 
-fn maintenance_tick(log: &mut Log) -> Result<(Vec<StreamId>, ReclaimReport)> {
-    // Call this from the application's timer. Camus has no timer thread.
-    let age_rotations = log.rollover_expired()?;
-    let reclaimed = log.reclaim()?;
-    Ok((age_rotations, reclaimed))
-}
+const BUFFER: StreamId = StreamId::new(3);
 
-fn main() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let config = Config::new(directory.path())
-        .with_segment_bytes(256)
-        .with_max_segment_age(Duration::from_secs(60 * 60));
-    let mut log = Log::open(config)?;
+#[tokio::main]
+async fn main() -> Result<()> {
+    let directory = tempfile::tempdir().expect("create temporary root");
+    let config = Config::new(
+        directory.path(),
+        Capacity::Bounded {
+            total_bytes: 8 * 1024 * 1024,
+            when_full: FullPolicy::Block,
+        },
+    )
+    .with_max_epoch_bytes(256 * 1024)
+    .with_segment_bytes(512 * 1024)
+    .with_max_release_records(1024)
+    .with_max_commit_bytes(512 * 1024);
+    let log = Log::open(config).await?;
+    let stream = log.stream(BUFFER);
 
-    // segment_bytes is a target. The first epoch is larger than the target but
-    // is never split. The next append rotates the non-empty active segment.
-    let first = log.append(Record::new("blob-1", vec![b'a'; 512]))?;
-    let second = log.append(Record::new("blob-2", vec![b'b'; 64]))?;
-    assert_eq!(first.segment_id, 0);
-    assert_eq!(second.segment_id, 1);
+    stream
+        .append(Record::new(Bytes::from(vec![b'x'; 128 * 1024])))
+        .await?;
+    let pending = stream.read(ReadLimits::new(16, 512 * 1024)).await?;
+    stream
+        .release(pending.iter().map(|record| record.id).collect())
+        .await?;
 
-    log.release(["blob-1", "blob-2"])?;
-    assert!(log.recovery().pending_records_iter().next().is_none());
-
-    let (age_rotations, ordinary) = maintenance_tick(&mut log)?;
-    assert!(age_rotations.is_empty());
-    assert_eq!(ordinary.segments, 1); // Sealed segment 0 was removed.
-
-    // Ordinary reclaim never rotates an active segment just to delete it.
-    // Under an explicit storage-pressure policy, Camus may rotate a fully
-    // released active segment and then reclaim it in manifest order.
-    let pressure = log.reclaim_active_for_storage_pressure()?;
-    assert_eq!(pressure.segments, 1);
-    assert!(!log.rollover(DEFAULT_STREAM)?); // New active is empty.
-
+    // Reclamation is automatic; this call is an optional barrier for one
+    // maintenance pass and may therefore report that automatic work won.
+    let report = log.reclaim().await?;
     let stats = log.stats();
     println!(
-        "epochs={}, segment_header_syncs={}, manifest_syncs={}, storage_bytes={}",
-        stats.epoch_syncs,
-        stats.segment_header_syncs,
-        stats.manifest_syncs,
-        log.storage_bytes()?
+        "explicit reclaim removed {} segments / {} bytes; root now uses {} bytes",
+        report.segments, report.bytes, stats.actual_file_bytes
     );
-    Ok(())
+    log.shutdown().await
 }

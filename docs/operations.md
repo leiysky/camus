@@ -1,222 +1,143 @@
 # Camus operations guide
 
-This guide defines the supported production envelope and the operator response
-to capacity, process, integrity, and upgrade events. The byte-level durability
-contract remains authoritative in [architecture.md](architecture.md).
+This guide describes the supported deployment envelope and operator response
+to capacity, integrity, process, and upgrade events. The normative durability
+order is in [architecture.md](architecture.md); exact bytes and recovery rules
+are in [file-format.md](file-format.md).
 
-## Supported environment
+## Supported storage environment
 
-Camus supports Unix targets and assumes a local filesystem with the following
-semantics:
+Camus currently supports Unix targets and assumes a local filesystem where:
 
-- `sync_data` makes previously written file data and required size metadata
-  durable;
-- directory `sync_all` makes create, rename, and delete operations durable;
-- rename within the storage root is atomic;
-- advisory exclusive locks coordinate every process that can open the root;
-  and
-- a successfully synced file is not silently reverted by a lower storage
-  layer.
+- `sync_data` durably publishes preceding file data and required size metadata;
+- directory `sync_all` durably publishes create, rename, and delete operations;
+- rename within the root is atomic; and
+- every process that can open a root honors advisory exclusive locks.
 
-Do not claim the Camus durability contract on NFS, SMB, FUSE, object-backed
-mounts, asynchronous replicas, or disk caches that ignore flushes without
-validating the complete failure matrix on that exact stack. Keep the manifest
-and all segments on the same filesystem.
+Do not claim the durability contract on NFS, SMB, object-backed mounts, FUSE,
+asynchronous replicas, or caches that ignore flushes without validating that
+stack's complete failure behavior. Keep `ROOT`, both manifest files, and
+`segments/` on one filesystem. Restrict direct write access; checksums detect
+accidents, not malicious modification.
 
-The embedding process must have durable read/write/create/delete access to the
-root and its parent directory. Restrict those permissions because checksums are
-not protection against a malicious writer.
+## Ownership and runtime
 
-Camus requests mode 0700 for directories and 0600 for files it creates; the
-process umask may make those modes stricter. Existing root permissions are
-preserved so operators can deliberately use a more specific owner/group model.
+One reactor owns all filesystem state for an open root. `Log`, `Stream`, and
+their clones are thread-safe clients. Stream handles keep the root alive, so a
+program may drop `Log` after constructing the handles it needs.
 
-## Ownership and shutdown
+The default runtime is a lazily initialized private process-wide Tokio runtime.
+A custom runtime is an execution contract: failure to spawn the reactor, a
+finite blocking job, or a deadline Future is a root progress failure. Benchmark
+the custom backend with realistic queue depth and storage latency before
+production use.
 
-Exactly one open `Log` owns a root, including all logical streams beneath it. A
-second owner receives `RootInUse`. All processes must honor the advisory lock;
-tools that edit files directly do not. `Log` is not `Sync`; serialize access
-when moving it behind an application mutex rather than issuing concurrent reads
-and writes against one handle.
+Prefer explicit `shutdown().await` during controlled service termination. It
+drains admitted operations and releases the lock before returning. Final-handle
+drop performs background shutdown and is unsuitable as a synchronization
+barrier before copying, replacing, or immediately reopening a root.
 
-Every successful state-changing API call performs its required sync before it
-returns. Dropping `Log` therefore does not perform a final commit. Graceful
-shutdown should stop new appends, finish in-flight calls, drop the handle, and
-only then copy, move, or inspect the root offline.
+## Durability and failure response
 
-## Failure handling
+Successful calls have definitive storage meaning:
 
-Successful calls have definitive outcomes:
+- append success means the complete epoch and commit marker were covered by a
+  successful data sync;
+- release success means the exact release frame was covered by a successful
+  manifest sync; and
+- reclaim success follows durable removal publication, physical deletion, and
+  segment-directory sync.
 
-- successful `append` or `append_batch` records are durable;
-- successful `release` markers are durable; and
-- successful reclamation has durably published segment removal before the
-  files are deleted.
+An I/O error after admission has an unknown durable outcome. An append or
+release may be present even when its caller receives an error. Do not retry by
+assuming absence. Stop using the poisoned root, close every handle, reopen,
+and reconcile from recovered pending records. Application idempotency keys in
+opaque metadata should make repeated downstream effects safe.
 
-An input error such as `InvalidRecord`, `DuplicateRecord`, `UnknownRecord`,
-`UnknownStream`, or `InvalidLocation` leaves the handle usable. I/O,
-corruption, codec, or internal-state errors poison the handle because the
-operation may have crossed a durability boundary before the error was
-observed.
+`Corruption` fails closed. Before manual action:
 
-When `log.is_poisoned()` is true:
+1. stop the owner and preserve a forensic copy of the complete root;
+2. record the exact Camus build, filesystem, kernel, and preceding failure;
+3. do not delete a manifest, segment, or tail merely to make open succeed; and
+4. restore a known-good complete snapshot or use a separately reviewed repair
+   tool that implements the exact format version.
 
-1. stop issuing storage operations through that handle;
-2. drop the handle so it releases files and the root lock;
-3. reopen the same root; and
-4. reconcile application work from `recovery().pending_records_iter()` or
-   `pending_records_for_iter(stream_id)`.
+Only the narrowly documented incomplete active tails and interrupted
+publication/deletion states are repaired automatically.
 
-Do not infer absence from an errored append or release. For example, an append
-can be synced and then encounter an injected process failure before the caller
-observes success. On reopen, the complete epoch is correctly recovered.
+## Capacity and pressure
 
-`Corruption` on open is fail-closed. Preserve a forensic copy of the entire
-root before attempting manual recovery. Do not delete a manifest, segment, or
-tail merely to make the root open: that can turn detectable damage into silent
-loss. Restore a known-good closed snapshot or use a separately reviewed repair
-tool that understands the exact format version.
+A bounded root preserves space for forward maintenance progress. Monitor:
 
-## Record identity and delivery
+- `actual_file_bytes` versus configured `total_bytes`;
+- `maintenance_headroom_bytes` and `data_admissible_bytes`;
+- queue depth, admission waiters, aggregate wait time, and maximum wait;
+- pending record and payload bytes root-wide and per logical stream;
+- append/release/reclaim errors and poisoned transitions; and
+- filesystem quota/free-space alerts independently of Camus capacity.
 
-Record IDs must be unique for the lifetime of one logical stream, including
-after release and reclamation. The same ID may be used in another stream.
-Camus rejects same-stream reuse while either live bytes or a retained release
-marker still exists, but manifest compaction can eventually discard both. The
-application remains responsible for generating non-repeating IDs within each
-stream.
+`Block` is backpressure, not data loss: an append waits outside the reactor
+queue while release and reclamation remain eligible. `RejectNew` is useful
+when the caller owns retry or spill policy. Neither mode evicts existing
+pending data. Camus has no per-stream quota or fairness guarantee; use separate
+roots or application admission for tenant isolation.
 
-Release only after the external effect is durably represented elsewhere. A
-crash between that effect and `release` causes replay, so destination writes or
-application-level deduplication must make repeated delivery safe.
+Device-full and quota failures are ordinary uncertain I/O errors. Leave enough
+filesystem headroom beyond Camus's configured total for filesystem metadata,
+other processes, and operational tooling.
 
-Treat this as an at-least-once storage contract, not an application execution
-guarantee. Within the supported storage envelope, a successful append remains
-recoverable until a release marker is durable. Camus does not ensure that a
-consumer task runs or that its destination accepts the record.
+## Segment lifecycle and space amplification
 
-### Consumer readiness
+All streams share one root-wide physical segment sequence. Size rollover is a
+hard final-file bound. Optional age rollover is a soft reactor deadline and can
+be delayed by a busy executor or slow storage operation.
 
-Clone `log.readiness()` into application async tasks and call
-`wait_for(stream_id).await` for streams they observe. No polling interval or
-background thread is involved: a successful durable append wakes the Wakers
-registered for that stream. Pending records recovered during open make the
-first wait complete immediately.
+Reclamation publishes and syncs `SegmentRemoved` before deleting the file, then
+syncs `segments/`. Recovery finishes a deletion left after the authoritative
+frame. A missing manifest-live segment is corruption.
 
-Treat wakeup as level state, not work assignment. Multiple waiters all wake,
-and repeated waits complete immediately until `release_from` leaves the stream
-with no pending records. The application still owns dispatch, retry, leases,
-backpressure, and idempotency. After readiness, ask the synchronous storage
-owner to enumerate `pending_records_for_iter`, read bounded batches, and
-release only completed record IDs.
+Because streams may interleave physically, one pending record can pin a whole
+segment containing otherwise released records. This is expected format-v1
+behavior, not a leak. Model worst-case stream interleaving and record lifetime
+when choosing root capacity and segment size.
 
-A readiness Future owns its shared handle and does not retain a `Log` borrow,
-which permits integration with any executor. Dropping the Future cancels that
-wait. Dropping or poisoning `Log` returns `ReadinessClosed` to all outstanding
-waiters; discard that readiness handle, reopen the root, and obtain a new one.
+## Recovery, startup, and memory
 
-## Capacity and reclamation
+Open structurally scans every extant segment descriptor and commit envelope,
+but opaque bodies remain lazy until read. Startup time and memory scale with
+stream count, physical record count, release state, and segment topology.
+Benchmark representative roots rather than extrapolating only from payload
+bytes.
 
-The configured `segment_bytes` is the default per-stream rotation target, not a
-hard record or epoch limit. `with_stream_rollover` overrides it for a selected
-stream. A single durability epoch is never split and may create a segment
-larger than the target. Size is evaluated immediately before each append.
-Rollover policies are open-time configuration rather than manifest state; pass
-the intended defaults and per-stream overrides on every reopen. Persisted
-segment creation times let a newly supplied age policy evaluate existing
-active segments without resetting their age.
-
-`max_segment_age` is optional and accepts positive whole-millisecond values.
-Append checks age before writing, while `rollover_expired()` lets the
-application check streams that are idle. Schedule that call at the
-application's required precision; Camus starts no timer. Empty active segments
-do not rotate, even if their creation time is old. A backward system-clock
-adjustment delays the trigger until Unix time catches up. Use
-`rollover(stream_id)` when policy requires an explicit boundary independent of
-size or age.
-
-Record IDs are limited to 16 KiB of UTF-8 bytes, and a record's encoded
-ID/metadata envelope, including its 4-byte ID-length field, is limited to 16
-MiB. One `release` call is encoded as one atomic manifest record and has the
-same 16 MiB metadata ceiling; split an oversized release set into smaller
-calls. Payload size is limited by the platform address space and available
-storage rather than by `segment_bytes`.
-
-Ordinary `reclaim` examines every stream and removes only fully released sealed
-segments. A fully released active segment remains until a later append or age
-check rotates it, the caller invokes `rollover`, or the caller explicitly
-invokes `reclaim_active_for_storage_pressure`.
-
-The limit-aware reclamation methods require enough observed storage and
-filesystem headroom to create a replacement segment header and temporary
-manifest checkpoint. Sealed segment deletion can still proceed when checkpoint
-compaction lacks headroom; compaction is retried by a later reclamation call.
-Free-space checks are preflight observations, not filesystem reservations;
-other users of the same filesystem can consume space immediately afterward.
-
-Monitor at least, broken down by logical stream where applicable:
-
-- `storage_bytes()` versus the root's filesystem quota;
-- filesystem free bytes;
-- pending record count, oldest application timestamp, and age-rollover
-  scheduler lag;
-- append/release error counts and `is_poisoned()` transitions;
-- `Stats::repaired_tails`, which should correspond to understood process or
-  power failures; and
-- reclaim reports and the number of segment files.
-
-Apply admission control before the filesystem reaches its reserve. Camus does
-not start a background reclaimer or reject writes according to an internal
-quota.
-
-## Recovery and scaling
-
-Open scans every manifest-declared stream and segment descriptor and retains
-recovered record metadata, locations, live IDs, and stream-scoped release IDs
-in memory. Payload bytes remain lazy. Benchmark startup time and memory using
-the expected number of streams, segments, records, record-ID lengths, and
-metadata sizes before selecting a recovery-time objective.
-
-Use `pending_records_iter()` when a borrowed scan is sufficient. The
-`pending_records()` convenience method clones every pending record and its
-metadata.
-
-`read_many` first groups locations by stream and then by segment, validates the
-segment header and each complete frame, and coalesces adjacent frames. Bound
-application batch sizes to control temporary read memory and payload lifetime.
+Read verifies the descriptor plus metadata and payload checksums for every
+selected record. A cold workload therefore moves verification cost from open
+to first delivery. Bound `ReadLimits` according to latency and memory targets.
 
 ## Backup and restore
 
-The simplest consistent backup is a copy made after dropping `Log`. An atomic
-filesystem or volume snapshot of the entire root is also acceptable while the
-process is running if the snapshot preserves a single point-in-time view of
-the manifest and all stream segment directories.
+The simplest consistent backup is a complete copy after explicit shutdown. A
+single-point-in-time filesystem or volume snapshot of the whole root is also
+acceptable if it preserves ordered file and directory state. Never restore
+only a manifest or selected segments.
 
-Never restore only `MANIFEST` or only selected segments. Restore the complete
-root into a new empty directory, verify permissions and available space, and
-open it with the same Camus format compatibility before switching the
-application to it.
+Restore into a new empty directory, validate permissions and capacity, open it
+with a compatible binary, and verify pending application work before switching
+traffic.
 
-## Upgrades
+## Upgrade policy
 
-On-disk format version 1 is strict and includes logical-stream events and
-persisted segment creation times. Unsupported headers fail closed; there is no
-implicit format guessing. Roots produced by pre-release builds that lack an
-active-segment timestamp receive one conservative, durably recorded baseline
-after their complete segment set validates successfully.
-Once that timestamp or any nondefault-stream event is written, a pre-release
-binary that does not understand those version-1 record kinds will fail closed;
-use the closed-root backup for rollback rather than trying to strip events.
-The frozen layouts, checksums, event schemas, and compatibility rules are in
-[file-format.md](file-format.md).
+The project is pre-release and format v1 is strict. Unsupported magic,
+versions, kinds, lengths, ordering, or noncanonical encodings fail closed; an
+old reader does not silently ignore new state.
 
-Before upgrading:
+Before an upgrade:
 
-1. stop the owner and take a complete closed-root backup;
-2. verify the new binary against a copy of representative production roots;
-3. run the full locked test and fuzz checks for the release; and
-4. confirm rollback compatibility before deleting the backup.
+1. explicitly shut down the owner;
+2. take a complete closed-root backup;
+3. test the new build on a copy of representative roots;
+4. run locked debug/release tests, docs, fuzz checks, audit, deny, and package
+   verification; and
+5. retain the backup until rollback requirements expire.
 
-If a future release changes its on-disk format, it must document an explicit
-forward and rollback procedure rather than silently rewriting authoritative
-state on open.
+Any future incompatible format change needs an explicit migration and rollback
+procedure. It must not be introduced as an incidental open-time rewrite.

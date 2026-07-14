@@ -10,13 +10,15 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
 libfuzzer-sys = "0.4"
 camus = { path = ".." }
 tempfile = "3.10"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [[bin]]
-name = "wal_recovery"
-path = "fuzz_targets/wal_recovery.rs"
+name = "segment_recovery"
+path = "fuzz_targets/segment_recovery.rs"
 test = false
 doc = false
 bench = false
