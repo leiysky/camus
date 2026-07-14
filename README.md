@@ -233,6 +233,13 @@ cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
 cargo package --locked
 ```
 
+Pull requests are checked for a semantic title and run formatting, Clippy,
+documentation, release-package, fuzz-target build, and locked test checks.
+Tests cover Ubuntu and macOS on the declared Rust toolchain, plus current
+stable Rust. Dependency-policy changes also run RustSec audits and license and
+source checks. Workflow actions are pinned to full commit SHAs and updated by
+Dependabot.
+
 The scheduled workflows run both recovery fuzz targets, audit `Cargo.lock`
 plus `fuzz/Cargo.lock` against the RustSec advisory database, and enforce the
 repository's dependency license and source policy.
