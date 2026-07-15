@@ -37,11 +37,11 @@ downstream idempotency.
 
 ## Install
 
-Camus is currently available as a 1.0 release candidate:
+Camus is available as a stable 1.0 release:
 
 ```toml
 [dependencies]
-camus = "1.0.0-rc.2"
+camus = "1.0.0"
 ```
 
 The 1.0 production durability target is Linux on a validated local filesystem.
@@ -472,7 +472,7 @@ cargo package --locked
 cargo publish --dry-run --locked
 ```
 
-Release candidates additionally use the manual-only
+Stable releases and release candidates additionally use the manual-only
 [`Release qualification`](docs/releasing.md#manual-release-qualification)
 workflow to validate candidate metadata, the applicable public-API baseline,
 and tests executed from Cargo's extracted package source. The workflow never
@@ -480,9 +480,9 @@ publishes or tags a release.
 
 ## License
 
-Current Camus development is licensed under the [MIT License](LICENSE-MIT).
-Published versions through `1.0.0-rc.2` remain under the
-[Apache License 2.0](https://github.com/leiysky/camus/blob/v1.0.0-rc.2/LICENSE-APACHE)
+Camus `1.0.0` and current development are licensed under the
+[MIT License](LICENSE-MIT). Published versions through `1.0.0-rc.2` remain
+under the [Apache License 2.0](https://github.com/leiysky/camus/blob/v1.0.0-rc.2/LICENSE-APACHE)
 included with those artifacts.
 
 [ci]: https://github.com/leiysky/camus/actions/workflows/ci.yml

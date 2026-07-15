@@ -7,6 +7,18 @@ version numbers.
 
 ## Unreleased
 
+## [1.0.0] - 2026-07-15
+
+- Stabilized the public Rust API and format-v1 compatibility boundary after
+  two public release candidates, without changing durability, recovery, or
+  at-least-once handoff semantics from `1.0.0-rc.2`.
+- Coalesced record and manifest commit-group writes and removed repeated file
+  metadata queries from durable append and release paths.
+- Cached segment stream counts and maintained incremental high-water and file
+  byte state, improving logical multi-stream scaling without coupling streams
+  to physical storage.
+- Bounded capacity-prefix admission searches, preserving exact global capacity
+  accounting while limiting worst-case evaluation work.
 - Relicensed current development from Apache-2.0 to MIT. Previously published
   artifacts retain the license terms shipped with them.
 

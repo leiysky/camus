@@ -509,8 +509,7 @@ async fn backlog(arguments: BacklogArgs) -> Result<()> {
         schema_version: 1,
         run_id: run_id.clone(),
         git_commit: command_output("git", &["rev-parse", "HEAD"]),
-        git_dirty: command_output("git", &["status", "--porcelain"])
-            .map(|status| !status.is_empty()),
+        git_dirty: git_worktree_dirty(),
         configuration: arguments.clone(),
         durable_records_before_kill: recovered.storage.pending_records,
         pending_payload_bytes_after_reopen: recovered.storage.pending_payload_bytes,
@@ -1085,8 +1084,7 @@ async fn run(arguments: RunArgs) -> Result<()> {
         schema_version: 1,
         run_id: run_id.clone(),
         git_commit: command_output("git", &["rev-parse", "HEAD"]),
-        git_dirty: command_output("git", &["status", "--porcelain"])
-            .map(|status| !status.is_empty()),
+        git_dirty: git_worktree_dirty(),
         started_unix_ms,
         ended_unix_ms,
         elapsed_seconds: started.elapsed().as_secs_f64(),
@@ -1298,4 +1296,16 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
     let value = String::from_utf8(output.stdout).ok()?;
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn git_worktree_dirty() -> Option<bool> {
+    let output = ProcessCommand::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    Some(!value.trim().is_empty())
 }
