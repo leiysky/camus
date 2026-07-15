@@ -147,7 +147,7 @@ impl Storage {
             control,
             initialized_temporaries.saturating_add(root_temporaries),
         )?;
-        storage.actual_file_bytes = storage.calculate_actual_file_bytes()?;
+        storage.actual_file_bytes = storage.calculate_actual_file_bytes_from_disk()?;
         storage.recovery.elapsed = started.elapsed();
         storage.validate_capacity()?;
         Ok(storage)
@@ -690,43 +690,47 @@ impl Storage {
             }
         }
 
-        let output = if let Some(active) = self.active_segment {
-            let start = self.segments[&active].records.len();
-            let appended_streams = prepared
-                .iter()
-                .map(|epoch| epoch.stream_id)
-                .collect::<BTreeSet<_>>();
-            let new_streams = appended_streams
-                .iter()
-                .filter(|stream_id| {
-                    self.streams
-                        .get(stream_id)
-                        .and_then(|stream| stream.last_segment_id)
-                        != Some(active)
-                })
-                .count();
-            let ids = self
-                .segments
-                .get_mut(&active)
-                .expect("active segment exists")
-                .append(self.root_id, prepared, new_streams)?;
-            self.index_durable_records(active, start)?;
-            ids
-        } else {
-            let segment_id = self.allocate_segment_id()?;
-            let created_at = unix_millis()?;
-            let (segment, ids) = Segment::create(
-                &self.segments_directory,
-                self.root_id,
-                segment_id,
-                created_at,
-                prepared,
-            )?;
-            self.segments.insert(segment_id, segment);
-            self.active_segment = Some(segment_id);
-            self.index_durable_records(segment_id, 0)?;
-            ids
-        };
+        let (output, previous_segment_bytes, current_segment_bytes) =
+            if let Some(active) = self.active_segment {
+                let previous_segment_bytes = self.segments[&active].file_len;
+                let start = self.segments[&active].records.len();
+                let appended_streams = prepared
+                    .iter()
+                    .map(|epoch| epoch.stream_id)
+                    .collect::<BTreeSet<_>>();
+                let new_streams = appended_streams
+                    .iter()
+                    .filter(|stream_id| {
+                        self.streams
+                            .get(stream_id)
+                            .and_then(|stream| stream.last_segment_id)
+                            != Some(active)
+                    })
+                    .count();
+                let ids = self
+                    .segments
+                    .get_mut(&active)
+                    .expect("active segment exists")
+                    .append(self.root_id, prepared, new_streams)?;
+                self.index_durable_records(active, start)?;
+                (ids, previous_segment_bytes, self.segments[&active].file_len)
+            } else {
+                let segment_id = self.allocate_segment_id()?;
+                let created_at = unix_millis()?;
+                let (segment, ids) = Segment::create(
+                    &self.segments_directory,
+                    self.root_id,
+                    segment_id,
+                    created_at,
+                    prepared,
+                )?;
+                let current_segment_bytes = segment.file_len;
+                self.segments.insert(segment_id, segment);
+                self.active_segment = Some(segment_id);
+                self.index_durable_records(segment_id, 0)?;
+                (ids, 0, current_segment_bytes)
+            };
+        self.replace_actual_file_bytes(previous_segment_bytes, current_segment_bytes)?;
         self.commits.append_groups = self.commits.append_groups.saturating_add(1);
         self.commits.append_units = self.commits.append_units.saturating_add(unit_count);
         self.commits.append_records = self.commits.append_records.saturating_add(appended_records);
@@ -737,7 +741,6 @@ impl Storage {
         self.commits.max_append_units = self.commits.max_append_units.max(unit_count);
         self.commits.max_append_encoded_bytes =
             self.commits.max_append_encoded_bytes.max(group_bytes);
-        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         Ok(output)
     }
 
@@ -942,8 +945,7 @@ impl Storage {
         if bodies.is_empty() {
             return Ok(());
         }
-        self.manifest
-            .append_group(&bodies, DurabilityOutcome::Unknown)?;
+        self.append_manifest_group(&bodies, DurabilityOutcome::Unknown)?;
         #[cfg(test)]
         crate::test_crash::hit("release.after_manifest_sync");
         self.commits.release_groups = self.commits.release_groups.saturating_add(1);
@@ -963,7 +965,6 @@ impl Storage {
                 self.mark_record_released(stream_id, sequence);
             }
         }
-        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         self.maybe_compact_manifest()?;
         Ok(())
     }
@@ -1056,10 +1057,8 @@ impl Storage {
             report.segments = report.segments.saturating_add(reclaimed.segments);
             report.bytes = report.bytes.saturating_add(reclaimed.bytes);
         }
-        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         if !report.is_empty() && self.segments.is_empty() {
             self.compact_manifest()?;
-            self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         } else {
             self.maybe_compact_manifest()?;
         }
@@ -1105,8 +1104,7 @@ impl Storage {
             .cloned()
             .map(ManifestBody::SegmentRemoved)
             .collect::<Vec<_>>();
-        self.manifest
-            .append_group(&frames, DurabilityOutcome::Unknown)?;
+        self.append_manifest_group(&frames, DurabilityOutcome::Unknown)?;
         #[cfg(test)]
         crate::test_crash::hit("reclaim.after_manifest_sync");
         for body in &removals {
@@ -1173,6 +1171,7 @@ impl Storage {
                 .iter()
                 .fold(0_u64, |total, bytes| total.saturating_add(*bytes)),
         };
+        self.subtract_actual_file_bytes(report.bytes)?;
         self.maintenance.reclaimed_segments = self
             .maintenance
             .reclaimed_segments
@@ -1181,7 +1180,6 @@ impl Storage {
             .maintenance
             .reclaimed_bytes
             .saturating_add(report.bytes);
-        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         Ok(report)
     }
 
@@ -1219,7 +1217,6 @@ impl Storage {
     pub(crate) fn seal_expired(&mut self) -> Result<bool> {
         if self.active_segment.is_some() && self.active_expired()? {
             self.seal_active(SealReason::Age)?;
-            self.actual_file_bytes = self.calculate_actual_file_bytes()?;
             self.maybe_compact_manifest()?;
             return Ok(true);
         }
@@ -1246,12 +1243,14 @@ impl Storage {
         let Some(segment_id) = self.active_segment else {
             return Ok(());
         };
+        let previous_segment_bytes = self.segments[&segment_id].file_len;
         let footer = self
             .segments
             .get_mut(&segment_id)
             .expect("active segment exists")
             .seal_data()?;
-        self.manifest.append_group(
+        self.replace_actual_file_bytes(previous_segment_bytes, footer.segment_bytes)?;
+        self.append_manifest_group(
             &[ManifestBody::SegmentSealed(SegmentSealedBody {
                 segment_id,
                 segment_bytes: footer.segment_bytes,
@@ -1319,7 +1318,10 @@ impl Storage {
             stream_highwaters,
             segments,
         );
+        let previous_control_bytes = self.manifest.control_file_len()?;
         self.manifest.compact(&checkpoint)?;
+        let current_control_bytes = self.manifest.control_file_len()?;
+        self.replace_actual_file_bytes(previous_control_bytes, current_control_bytes)?;
         self.maintenance.manifest_compactions =
             self.maintenance.manifest_compactions.saturating_add(1);
         for stream in self.streams.values_mut() {
@@ -1329,7 +1331,7 @@ impl Storage {
     }
 
     fn maybe_compact_manifest(&mut self) -> Result<bool> {
-        let log_bytes = self.manifest.file_len()?;
+        let log_bytes = self.manifest.file_len();
         if !manifest_compaction_required(
             log_bytes,
             self.actual_file_bytes,
@@ -1339,7 +1341,6 @@ impl Storage {
             return Ok(false);
         }
         self.compact_manifest()?;
-        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
         Ok(true)
     }
 
@@ -1725,7 +1726,40 @@ impl Storage {
         Ok(release_frame.max(80).max(removal_group))
     }
 
-    fn calculate_actual_file_bytes(&self) -> Result<u64> {
+    fn append_manifest_group(
+        &mut self,
+        bodies: &[ManifestBody],
+        outcome: DurabilityOutcome,
+    ) -> Result<()> {
+        let previous_control_bytes = self.manifest.control_file_len()?;
+        self.manifest.append_group(bodies, outcome)?;
+        let current_control_bytes = self.manifest.control_file_len()?;
+        self.replace_actual_file_bytes(previous_control_bytes, current_control_bytes)
+    }
+
+    fn replace_actual_file_bytes(&mut self, previous: u64, current: u64) -> Result<()> {
+        self.actual_file_bytes = self
+            .actual_file_bytes
+            .checked_sub(previous)
+            .and_then(|bytes| bytes.checked_add(current))
+            .ok_or_else(|| {
+                Error::corruption(
+                    &self.config.root,
+                    0,
+                    "root byte accounting replacement overflow",
+                )
+            })?;
+        Ok(())
+    }
+
+    fn subtract_actual_file_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.actual_file_bytes = self.actual_file_bytes.checked_sub(bytes).ok_or_else(|| {
+            Error::corruption(&self.config.root, 0, "root byte accounting underflow")
+        })?;
+        Ok(())
+    }
+
+    fn calculate_actual_file_bytes_from_disk(&self) -> Result<u64> {
         let mut bytes = ROOT_SUPERBLOCK_LEN;
         for path in [
             self.config.root.join(CHECKPOINT_FILE),
@@ -2086,6 +2120,18 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
+    fn assert_file_byte_accounting(storage: &Storage) {
+        let control_bytes = file_len(&storage.config.root.join(CHECKPOINT_FILE))
+            .unwrap()
+            .checked_add(file_len(&storage.config.root.join(MANIFEST_LOG_FILE)).unwrap())
+            .unwrap();
+        assert_eq!(storage.manifest.control_file_len().unwrap(), control_bytes);
+        assert_eq!(
+            storage.actual_file_bytes,
+            storage.calculate_actual_file_bytes_from_disk().unwrap()
+        );
+    }
+
     fn config(directory: &TempDir) -> Config {
         Config::new(directory.path(), Capacity::Unbounded)
             .with_max_epoch_bytes(1024 * 1024)
@@ -2113,6 +2159,58 @@ mod tests {
         };
         assert!(!manifest_compaction_required(1, 100, 100, bounded));
         assert!(manifest_compaction_required(1, 101, 100, bounded));
+    }
+
+    #[test]
+    fn file_byte_accounting_tracks_every_durable_transition() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(91);
+        {
+            let mut storage = Storage::open(config(&directory)).unwrap();
+            assert_file_byte_accounting(&storage);
+
+            let first = storage
+                .append_group(vec![AppendUnit {
+                    stream_id,
+                    records: vec![Record::new(Bytes::from_static(b"first"))],
+                }])
+                .unwrap()
+                .remove(0)
+                .remove(0);
+            assert_file_byte_accounting(&storage);
+
+            let second = storage
+                .append_group(vec![AppendUnit {
+                    stream_id,
+                    records: vec![Record::new(Bytes::from_static(b"second"))],
+                }])
+                .unwrap()
+                .remove(0)
+                .remove(0);
+            assert_file_byte_accounting(&storage);
+
+            storage.seal_active(SealReason::Size).unwrap();
+            assert_file_byte_accounting(&storage);
+
+            storage.compact_manifest().unwrap();
+            assert_file_byte_accounting(&storage);
+
+            storage
+                .release_group(vec![ReleaseUnit {
+                    stream_id,
+                    ids: vec![first, second],
+                }])
+                .unwrap();
+            assert_file_byte_accounting(&storage);
+
+            let report = storage.reclaim(ReclaimKind::Explicit).unwrap();
+            assert_eq!(report.segments, 1);
+            assert_file_byte_accounting(&storage);
+        }
+
+        let storage = Storage::open(config(&directory)).unwrap();
+        assert_file_byte_accounting(&storage);
+        assert_eq!(storage.stream_stats(stream_id).pending_records, 0);
     }
 
     #[test]
@@ -2421,7 +2519,7 @@ mod tests {
                 }])
                 .unwrap();
             assert_eq!(storage.maintenance_stats().manifest_compactions, 0);
-            assert!(storage.manifest.file_len().unwrap() > MANIFEST_LOG_HEADER_LEN);
+            assert!(storage.manifest.file_len() > MANIFEST_LOG_HEADER_LEN);
         }
 
         let storage = Storage::open(bounded).unwrap();
