@@ -7,12 +7,14 @@ on:
       - Cargo.toml
       - Cargo.lock
       - deny.toml
+      - rust-toolchain.toml
       - fuzz/Cargo.toml
       - fuzz/Cargo.lock
       - benchmarks/Cargo.toml
       - benchmarks/Cargo.lock
       - smoke/Cargo.toml
       - smoke/Cargo.lock
+      - .github/workflows/security.yml
   pull_request: {}
   schedule:
     - cron: "41 4 * * 1"
@@ -28,20 +30,47 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Detect dependency policy changes
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            Cargo.toml Cargo.lock deny.toml rust-toolchain.toml \
+            fuzz/Cargo.toml fuzz/Cargo.lock \
+            benchmarks/Cargo.toml benchmarks/Cargo.lock \
+            smoke/Cargo.toml smoke/Cargo.lock \
+            .github/workflows/security.yml; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install cargo-audit
+        if: steps.scope.outputs.run == 'true'
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: Install cargo-deny
+        if: steps.scope.outputs.run == 'true'
         run: cargo install cargo-deny --locked --version 0.20.2
       - name: Audit crate dependencies
+        if: steps.scope.outputs.run == 'true'
         run: cargo audit --deny warnings
       - name: Audit fuzz dependencies
+        if: steps.scope.outputs.run == 'true'
         run: cargo audit --deny warnings --file fuzz/Cargo.lock
       - name: Audit benchmark dependencies
+        if: steps.scope.outputs.run == 'true'
         run: cargo audit --deny warnings --file benchmarks/Cargo.lock
       - name: Audit smoke dependencies
+        if: steps.scope.outputs.run == 'true'
         run: cargo audit --deny warnings --file smoke/Cargo.lock
       - name: Check dependency licenses and sources
+        if: steps.scope.outputs.run == 'true'
         run: |
           cargo deny --locked check -A license-not-encountered licenses sources
           cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources

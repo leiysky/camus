@@ -129,6 +129,43 @@ system page cache. Cold-start measurement requires host-specific privileged
 cache control or a dataset larger than memory and belongs in a separate test
 protocol.
 
+## Manifest compaction diagnostic
+
+The standalone runner also has a Camus-only mixed-workload diagnostic for the
+current manifest compaction boundary. It does not compile redb or RocksDB:
+
+```sh
+cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
+  --no-default-features -- \
+  manifest-compaction \
+  --data-directory /path/on/device/camus-benchmark-data
+```
+
+The default setup appends 524,288 empty records in 4,096-record epochs and
+releases alternating sequence numbers in eight 65,536-ID calls. Each call
+therefore encodes singleton release ranges. The eighth frame crosses the
+current 8 MiB manifest-log threshold and forces a complete checkpoint rewrite.
+One unreleased anchor prevents reclamation from entering that measured window.
+
+After admitting the trigger release, the runner polls for its storage job and
+then starts eight independent foreground streams. Each performs 32 verified
+append/read/release cycles. Detailed observability is enabled for this command.
+The schema-versioned JSON report keeps the trigger release's caller latency,
+the release storage-job delta sampled when its reply is observed, compaction
+counts, and foreground p50/p95/p99/maximum latencies. Cleanup releases the
+anchor, performs reclamation, verifies that no pending records remain, and
+shuts down cleanly.
+
+This diagnostic answers whether the current stop-the-root checkpoint rewrite
+creates a material foreground tail-latency window for a given root size and
+device. It is intentionally manual and is not a stable regression gate: the
+8 MiB policy is an implementation detail, setup performs durable writes, and
+filesystem sync latency is host-specific. Compare reports only on the same
+controlled Linux host and storage configuration. Use argument overrides to
+explore scale, and treat a run where
+`storage_job_observed_in_flight` is `false` as non-overlapping rather than as a
+foreground compaction measurement.
+
 ## Metrics and report format
 
 The runner emits schema-versioned JSON containing the Git revision and dirty

@@ -93,7 +93,6 @@ name = "camus"
 version = "1.0.0"
 dependencies = [
  "bytes",
- "fs2",
  "getrandom",
  "thiserror",
  "tokio",
