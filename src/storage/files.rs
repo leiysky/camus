@@ -2,7 +2,7 @@ use crate::error::{DurabilityOutcome, Error, Result};
 use fs2::FileExt;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::os::unix::fs::FileExt as UnixFileExt;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +16,35 @@ pub(super) const MANIFEST_LOG_TEMP_FILE: &str = "MANIFEST.log.tmp";
 pub(super) const SEGMENTS_DIRECTORY: &str = "segments";
 
 pub(super) struct RootLock(File);
+
+pub(super) fn write_all_vectored<W: Write>(
+    writer: &mut W,
+    path: &Path,
+    slices: &mut [IoSlice<'_>],
+    operation: &'static str,
+    outcome: DurabilityOutcome,
+) -> Result<()> {
+    // `write_vectored` writes a platform-supported prefix when the slice count
+    // exceeds one syscall's iovec bound. Advancing that prefix also handles
+    // ordinary partial writes without imposing a smaller fixed limit.
+    let mut remaining = slices;
+    while !remaining.is_empty() {
+        match writer.write_vectored(remaining) {
+            Ok(0) => {
+                return Err(Error::io(
+                    operation,
+                    path,
+                    outcome,
+                    io::Error::new(io::ErrorKind::WriteZero, "failed to write all buffers"),
+                ));
+            }
+            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Error::io(operation, path, outcome, error)),
+        }
+    }
+    Ok(())
+}
 
 impl Drop for RootLock {
     fn drop(&mut self) {

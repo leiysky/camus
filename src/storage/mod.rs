@@ -1089,25 +1089,23 @@ impl Storage {
                     .map(|sequence| (*stream_id, sequence))
             })
             .collect::<BTreeMap<_, _>>();
-        let removals = eligible
+        let frames = eligible
             .iter()
             .map(|segment_id| {
                 let body = self.removal_body(*segment_id, &persisted_highwaters);
                 for highwater in &body.highwaters {
                     persisted_highwaters.insert(highwater.stream_id, highwater.sequence);
                 }
-                body
+                ManifestBody::SegmentRemoved(body)
             })
-            .collect::<Vec<_>>();
-        let frames = removals
-            .iter()
-            .cloned()
-            .map(ManifestBody::SegmentRemoved)
             .collect::<Vec<_>>();
         self.append_manifest_group(&frames, DurabilityOutcome::Unknown)?;
         #[cfg(test)]
         crate::test_crash::hit("reclaim.after_manifest_sync");
-        for body in &removals {
+        for frame in &frames {
+            let ManifestBody::SegmentRemoved(body) = frame else {
+                unreachable!("reclaim group contains only segment removals");
+            };
             for highwater in &body.highwaters {
                 self.streams
                     .get_mut(&highwater.stream_id)
@@ -2320,6 +2318,56 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(ids[0].stream_id(), stream_id);
+    }
+
+    #[test]
+    fn multi_frame_manifest_group_recovers_every_release() {
+        let directory = TempDir::new().unwrap();
+        let first_stream = StreamId::new(81);
+        let second_stream = StreamId::new(82);
+        {
+            let mut storage = Storage::open(config(&directory)).unwrap();
+            let mut ids = storage
+                .append_group(vec![
+                    AppendUnit {
+                        stream_id: first_stream,
+                        records: vec![Record::new(Bytes::from_static(b"first"))],
+                    },
+                    AppendUnit {
+                        stream_id: second_stream,
+                        records: vec![Record::new(Bytes::from_static(b"second"))],
+                    },
+                ])
+                .unwrap();
+            storage
+                .release_group(vec![
+                    ReleaseUnit {
+                        stream_id: first_stream,
+                        ids: ids.remove(0),
+                    },
+                    ReleaseUnit {
+                        stream_id: second_stream,
+                        ids: ids.remove(0),
+                    },
+                ])
+                .unwrap();
+            assert_eq!(storage.commit_stats().release_groups, 1);
+            assert_eq!(storage.commit_stats().release_units, 2);
+            assert_eq!(
+                storage.manifest.file_len(),
+                MANIFEST_LOG_HEADER_LEN + 2 * (MANIFEST_FRAME_HEADER_LEN + 40)
+            );
+        }
+
+        let storage = Storage::open(config(&directory)).unwrap();
+        assert!(storage
+            .read(first_stream, ReadLimits::new(1, 1024))
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .read(second_stream, ReadLimits::new(1, 1024))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
