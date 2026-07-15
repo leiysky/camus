@@ -7,6 +7,9 @@ version numbers.
 
 ## Unreleased
 
+- Relicensed current development from Apache-2.0 to MIT. Previously published
+  artifacts retain the license terms shipped with them.
+
 ## [1.0.0-rc.2] - 2026-07-15
 
 - Immutable format-v1 compatibility fixture written by the published
