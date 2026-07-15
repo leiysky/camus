@@ -2,6 +2,7 @@ mod diagnostics;
 mod engines;
 mod metrics;
 mod model;
+mod scenarios;
 mod workloads;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -39,6 +40,8 @@ enum Command {
     Compare(CompareArgs),
     /// Measure foreground latency while Camus compacts a large manifest.
     ManifestCompaction(diagnostics::ManifestCompactionArgs),
+    /// Run finite Camus application-scenario workloads.
+    Scenarios(scenarios::ScenarioArgs),
 }
 
 #[derive(Debug, Args)]
@@ -261,6 +264,7 @@ async fn main() -> Result<()> {
         Command::Run(arguments) => run(arguments).await,
         Command::Compare(arguments) => compare(arguments),
         Command::ManifestCompaction(arguments) => diagnostics::manifest_compaction(arguments).await,
+        Command::Scenarios(arguments) => scenarios::run(arguments).await,
     }
 }
 
