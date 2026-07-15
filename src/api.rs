@@ -65,8 +65,13 @@ struct View {
     maintenance: MaintenanceStats,
     recovery: RecoveryStats,
     known_streams: Vec<StreamId>,
-    stream_stats: BTreeMap<StreamId, StreamStats>,
-    highwaters: BTreeMap<StreamId, u64>,
+    streams: BTreeMap<StreamId, PublishedStream>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct PublishedStream {
+    stats: StreamStats,
+    highwater: u64,
 }
 
 struct Shared {
@@ -448,9 +453,9 @@ impl Stream {
     pub fn stats(&self) -> StreamStats {
         self.shared
             .read_view()
-            .stream_stats
+            .streams
             .get(&self.id)
-            .cloned()
+            .map(|stream| stream.stats.clone())
             .unwrap_or_default()
     }
 
@@ -624,7 +629,13 @@ impl Stream {
     fn preflight_sequence(&self, records: usize) -> Result<()> {
         let count = u64::try_from(records)
             .map_err(|_| Error::invalid_config("append record count does not fit u64"))?;
-        if let Some(highwater) = self.shared.read_view().highwaters.get(&self.id).copied() {
+        if let Some(highwater) = self
+            .shared
+            .read_view()
+            .streams
+            .get(&self.id)
+            .map(|stream| stream.highwater)
+        {
             highwater
                 .checked_add(count)
                 .ok_or(Error::SequenceExhausted { stream_id: self.id })?;
@@ -634,7 +645,7 @@ impl Stream {
 
     fn preflight_release(&self, ids: &[RecordId]) -> Result<()> {
         let view = self.shared.read_view();
-        let highwater = view.highwaters.get(&self.id).copied();
+        let highwater = view.streams.get(&self.id).map(|stream| stream.highwater);
         for id in ids {
             if id.root_id() != self.shared.root_id || id.stream_id() != self.id {
                 return Err(Error::RecordIdScopeMismatch {
@@ -1221,10 +1232,6 @@ async fn reactor_loop(
                 let mut entries: Vec<AppendEntry> =
                     vec![(stream_id, records, encoded_bytes, reply)];
                 let mut group_bytes = encoded_bytes;
-                let highwaters = shared
-                    .upgrade()
-                    .map(|shared| shared.read_view().highwaters.clone())
-                    .unwrap_or_default();
                 let mut group_records = BTreeMap::new();
                 group_records.insert(
                     stream_id,
@@ -1249,9 +1256,11 @@ async fn reactor_loop(
                                 .copied()
                                 .unwrap_or(0)
                                 .checked_add(record_count);
+                            let highwater = storage
+                                .as_ref()
+                                .and_then(|storage| storage.stream_highwater(stream_id));
                             let sequence_fits = cumulative.is_some_and(|count| {
-                                highwaters
-                                    .get(&stream_id)
+                                highwater
                                     .is_none_or(|highwater| highwater.checked_add(count).is_some())
                             });
                             let bytes_fit = group_bytes
@@ -1692,9 +1701,19 @@ where
 
 fn view_from_storage(storage: &Storage) -> Result<View> {
     let known_streams = storage.known_streams();
-    let stream_stats = known_streams
+    let streams = known_streams
         .iter()
-        .map(|stream_id| (*stream_id, storage.stream_stats(*stream_id)))
+        .map(|stream_id| {
+            (
+                *stream_id,
+                PublishedStream {
+                    stats: storage.stream_stats(*stream_id),
+                    highwater: storage
+                        .stream_highwater(*stream_id)
+                        .expect("known stream has a highwater"),
+                },
+            )
+        })
         .collect();
     Ok(View {
         storage: storage.storage_stats()?,
@@ -1702,8 +1721,7 @@ fn view_from_storage(storage: &Storage) -> Result<View> {
         maintenance: storage.maintenance_stats(),
         recovery: storage.recovery_stats(),
         known_streams,
-        stream_stats,
-        highwaters: storage.stream_highwaters(),
+        streams,
     })
 }
 
@@ -1744,17 +1762,17 @@ fn publish_storage(shared: &Weak<Shared>, storage: Option<&Storage>, streams: &[
     current.recovery = recovery;
     for stream_id in streams {
         let stats = storage.stream_stats(*stream_id);
-        if stats.durable_known || current.stream_stats.contains_key(stream_id) {
-            state_changed |= current.stream_stats.get(stream_id) != Some(&stats);
-            current.stream_stats.insert(*stream_id, stats);
-        }
         if let Some(highwater) = storage.stream_highwater(*stream_id) {
-            state_changed |= current.highwaters.get(stream_id) != Some(&highwater);
-            current.highwaters.insert(*stream_id, highwater);
+            let published = PublishedStream { stats, highwater };
+            state_changed |= current.streams.get(stream_id) != Some(&published);
+            current.streams.insert(*stream_id, published);
             if let Err(index) = current.known_streams.binary_search(stream_id) {
                 current.known_streams.insert(index, *stream_id);
                 state_changed = true;
             }
+        } else if let Some(published) = current.streams.get_mut(stream_id) {
+            state_changed |= published.stats != stats;
+            published.stats = stats;
         }
     }
     drop(current);

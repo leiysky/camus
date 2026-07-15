@@ -1368,13 +1368,6 @@ impl Storage {
             })
     }
 
-    pub(crate) fn stream_highwaters(&self) -> BTreeMap<StreamId, u64> {
-        self.streams
-            .iter()
-            .filter_map(|(stream_id, stream)| stream.highwater.map(|value| (*stream_id, value)))
-            .collect()
-    }
-
     pub(crate) fn storage_stats(&self) -> Result<StorageStats> {
         let headroom = self.maintenance_headroom_bytes()?;
         let data_admissible_bytes = match self.config.capacity {
