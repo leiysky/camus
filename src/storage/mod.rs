@@ -94,6 +94,9 @@ struct RecordPointer {
 struct StreamState {
     highwater: Option<u64>,
     persisted_highwater: Option<u64>,
+    // Used only for equality with the current active segment. Segment IDs are
+    // never reused, so reclamation does not need to repair this marker.
+    last_segment_id: Option<u64>,
     pending: BTreeMap<u64, RecordPointer>,
     pending_payload_bytes: u64,
 }
@@ -477,6 +480,10 @@ impl Storage {
                             record.descriptor_offset,
                         )?;
                     }
+                    self.streams
+                        .entry(record.stream_id)
+                        .or_default()
+                        .last_segment_id = Some(segment_id);
                 }
             }
             if let Some(removed) = removed_segments.get(&segment_id) {
@@ -685,11 +692,24 @@ impl Storage {
 
         let output = if let Some(active) = self.active_segment {
             let start = self.segments[&active].records.len();
+            let appended_streams = prepared
+                .iter()
+                .map(|epoch| epoch.stream_id)
+                .collect::<BTreeSet<_>>();
+            let new_streams = appended_streams
+                .iter()
+                .filter(|stream_id| {
+                    self.streams
+                        .get(stream_id)
+                        .and_then(|stream| stream.last_segment_id)
+                        != Some(active)
+                })
+                .count();
             let ids = self
                 .segments
                 .get_mut(&active)
                 .expect("active segment exists")
-                .append(self.root_id, prepared)?;
+                .append(self.root_id, prepared, new_streams)?;
             self.index_durable_records(active, start)?;
             ids
         } else {
@@ -773,6 +793,7 @@ impl Storage {
                 ));
             }
             stream.highwater = Some(record.sequence);
+            stream.last_segment_id = Some(segment_id);
             stream.pending.insert(
                 record.sequence,
                 RecordPointer {
@@ -1558,10 +1579,10 @@ impl Storage {
                 let added_streams = record_counts
                     .keys()
                     .filter(|stream_id| {
-                        !segment
-                            .records
-                            .iter()
-                            .any(|record| record.stream_id == **stream_id)
+                        self.streams
+                            .get(stream_id)
+                            .and_then(|stream| stream.last_segment_id)
+                            != Some(*segment_id)
                     })
                     .count();
                 streams = streams
@@ -2092,6 +2113,78 @@ mod tests {
         };
         assert!(!manifest_compaction_required(1, 100, 100, bounded));
         assert!(manifest_compaction_required(1, 101, 100, bounded));
+    }
+
+    #[test]
+    fn segment_stream_count_tracks_appends_and_recovery() {
+        let directory = TempDir::new().unwrap();
+        let first = StreamId::new(1);
+        let second = StreamId::new(2);
+        let third = StreamId::new(3);
+        {
+            let mut storage = Storage::open(config(&directory)).unwrap();
+            storage
+                .append_group(vec![
+                    AppendUnit {
+                        stream_id: first,
+                        records: vec![Record::new(Bytes::from_static(b"first"))],
+                    },
+                    AppendUnit {
+                        stream_id: second,
+                        records: vec![Record::new(Bytes::from_static(b"second"))],
+                    },
+                ])
+                .unwrap();
+            storage
+                .append_group(vec![AppendUnit {
+                    stream_id: first,
+                    records: vec![Record::new(Bytes::from_static(b"again"))],
+                }])
+                .unwrap();
+            let active = storage.active_segment.unwrap();
+            assert_eq!(storage.segments[&active].unique_stream_count(), 2);
+            assert_eq!(storage.streams[&first].last_segment_id, Some(active));
+            assert_eq!(storage.streams[&second].last_segment_id, Some(active));
+            storage.seal_active(SealReason::Size).unwrap();
+            storage
+                .append_group(vec![
+                    AppendUnit {
+                        stream_id: first,
+                        records: vec![Record::new(Bytes::from_static(b"new segment"))],
+                    },
+                    AppendUnit {
+                        stream_id: third,
+                        records: vec![Record::new(Bytes::from_static(b"third"))],
+                    },
+                ])
+                .unwrap();
+            let next = storage.active_segment.unwrap();
+            assert_ne!(next, active);
+            assert_eq!(storage.segments[&active].unique_stream_count(), 2);
+            assert_eq!(storage.segments[&next].unique_stream_count(), 2);
+            assert_eq!(storage.streams[&first].last_segment_id, Some(next));
+            assert_eq!(storage.streams[&second].last_segment_id, Some(active));
+            assert_eq!(storage.streams[&third].last_segment_id, Some(next));
+        }
+
+        let mut storage = Storage::open(config(&directory)).unwrap();
+        let active = storage.active_segment.unwrap();
+        let sealed = *storage.segments.keys().next().unwrap();
+        assert_ne!(active, sealed);
+        assert_eq!(storage.segments[&sealed].unique_stream_count(), 2);
+        assert_eq!(storage.segments[&active].unique_stream_count(), 2);
+        assert_eq!(storage.streams[&first].last_segment_id, Some(active));
+        assert_eq!(storage.streams[&second].last_segment_id, Some(sealed));
+        assert_eq!(storage.streams[&third].last_segment_id, Some(active));
+
+        storage
+            .append_group(vec![AppendUnit {
+                stream_id: second,
+                records: vec![Record::new(Bytes::from_static(b"second again"))],
+            }])
+            .unwrap();
+        assert_eq!(storage.segments[&active].unique_stream_count(), 3);
+        assert_eq!(storage.streams[&second].last_segment_id, Some(active));
     }
 
     #[test]

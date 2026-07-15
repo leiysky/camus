@@ -7,7 +7,7 @@ use crate::format::{
 };
 use crate::model::{PendingRecord, Record, RecordId, RootId, StreamId};
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IoSlice, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,7 @@ pub(super) struct Segment {
     pub(super) header_bytes: [u8; SEGMENT_HEADER_LEN as usize],
     pub(super) file_len: u64,
     pub(super) records: Vec<StoredRecord>,
+    unique_streams: usize,
     pub(super) unreleased_records: u64,
     pub(super) epochs: Vec<EpochBoundary>,
     pub(super) footer: Option<SegmentFooter>,
@@ -346,6 +347,7 @@ impl Segment {
         })?;
         let unreleased_records = u64::try_from(records.len())
             .map_err(|_| Error::corruption(&path, 0, "segment record count does not fit u64"))?;
+        let unique_streams = stream_sequences.len();
         Ok(Self {
             id: expected_segment_id,
             path,
@@ -354,6 +356,7 @@ impl Segment {
             header_bytes,
             file_len,
             records,
+            unique_streams,
             unreleased_records,
             epochs,
             footer,
@@ -407,9 +410,11 @@ impl Segment {
 
         let mut offset = SEGMENT_HEADER_LEN;
         let mut records = Vec::new();
+        let mut stream_ids = BTreeSet::new();
         let mut boundaries = Vec::new();
         let mut ids = Vec::with_capacity(epochs.len());
         for written in write_epoch_group(&mut file, &temporary, offset, epochs)? {
+            stream_ids.extend(written.records.iter().map(|record| record.stream_id));
             ids.push(
                 written
                     .records
@@ -489,6 +494,7 @@ impl Segment {
                 header_bytes,
                 file_len: offset,
                 records,
+                unique_streams: stream_ids.len(),
                 unreleased_records,
                 epochs: boundaries,
                 footer: None,
@@ -502,7 +508,14 @@ impl Segment {
         &mut self,
         root_id: RootId,
         epochs: Vec<PreparedEpoch>,
+        new_streams: usize,
     ) -> Result<Vec<Vec<RecordId>>> {
+        let unique_streams = self
+            .unique_streams
+            .checked_add(new_streams)
+            .ok_or_else(|| {
+                Error::corruption(&self.path, self.file_len, "segment stream count overflow")
+            })?;
         if self.footer.is_some() {
             return Err(Error::corruption(
                 &self.path,
@@ -543,6 +556,7 @@ impl Segment {
         #[cfg(test)]
         crate::test_crash::hit("segment.append.after_data_sync");
 
+        self.unique_streams = unique_streams;
         let mut ids = Vec::with_capacity(written_epochs.len());
         for written in written_epochs {
             self.unreleased_records = self
@@ -780,14 +794,7 @@ impl Segment {
     }
 
     pub(super) fn unique_stream_count(&self) -> usize {
-        let mut streams = self
-            .records
-            .iter()
-            .map(|record| record.stream_id)
-            .collect::<Vec<_>>();
-        streams.sort_unstable();
-        streams.dedup();
-        streams.len()
+        self.unique_streams
     }
 }
 
