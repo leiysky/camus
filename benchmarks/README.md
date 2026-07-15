@@ -26,11 +26,25 @@ cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
   run --engines camus,simple-append-file --profile smoke
 ```
 
+To measure foreground latency across one forced Camus manifest compaction,
+without compiling any comparison engine:
+
+```sh
+cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
+  --no-default-features -- \
+  manifest-compaction
+```
+
+This is a manual Camus-only diagnostic. It prepares a large sparse release
+history, starts the release expected to cross the current compaction threshold,
+and issues verified append/read/release cycles on independent foreground
+streams while that storage job is active.
+
 The runner validates recovered pending counts and complete drains, prints a
 summary, and writes a versioned JSON report under `target/benchmark-results`
 unless `--output` is specified. See
 [`docs/benchmarks.md`](../docs/benchmarks.md) for the methodology, workload
-definitions, platform controls, and comparison command.
+definitions, compaction diagnostic, platform controls, and comparison command.
 
 RocksDB measurements are disabled on macOS. Even when its feature is enabled,
 the runner excludes RocksDB from automatic engine selection and rejects

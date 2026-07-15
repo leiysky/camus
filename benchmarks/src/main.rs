@@ -1,3 +1,4 @@
+mod diagnostics;
 mod engines;
 mod metrics;
 mod model;
@@ -36,6 +37,8 @@ enum Command {
     Run(RunArgs),
     /// Compare two reports and fail when configured regression limits are exceeded.
     Compare(CompareArgs),
+    /// Measure foreground latency while Camus compacts a large manifest.
+    ManifestCompaction(diagnostics::ManifestCompactionArgs),
 }
 
 #[derive(Debug, Args)]
@@ -257,6 +260,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(arguments) => run(arguments).await,
         Command::Compare(arguments) => compare(arguments),
+        Command::ManifestCompaction(arguments) => diagnostics::manifest_compaction(arguments).await,
     }
 }
 

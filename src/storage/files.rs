@@ -1,7 +1,6 @@
 use crate::error::{DurabilityOutcome, Error, Result};
-use fs2::FileExt;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, IoSlice, Read, Write};
 use std::os::unix::fs::FileExt as UnixFileExt;
 use std::path::{Path, PathBuf};
@@ -51,7 +50,7 @@ impl Drop for RootLock {
         // A concurrently forked process can briefly inherit this open file
         // description before exec closes it. Explicitly unlocking prevents an
         // inherited or duplicated descriptor from extending root ownership.
-        let _ = FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -114,12 +113,12 @@ pub(super) fn acquire_lock(root: &Path) -> Result<RootLock> {
                 error,
             )
         })?;
-    match file.try_lock_exclusive() {
+    match file.try_lock() {
         Ok(()) => Ok(RootLock(file)),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(Error::RootInUse {
+        Err(TryLockError::WouldBlock) => Err(Error::RootInUse {
             path: root.to_path_buf(),
         }),
-        Err(error) => Err(Error::io(
+        Err(TryLockError::Error(error)) => Err(Error::io(
             "lock storage root",
             &path,
             DurabilityOutcome::NotApplicable,
