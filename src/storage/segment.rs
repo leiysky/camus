@@ -61,6 +61,13 @@ struct WrittenEpoch {
     end_offset: u64,
 }
 
+struct PendingEpochWrite {
+    epoch: PreparedEpoch,
+    records: Vec<StoredRecord>,
+    commit: [u8; EPOCH_COMMIT_LEN as usize],
+    end_offset: u64,
+}
+
 // Bound shared read backing buffers so retaining one returned body cannot pin
 // an arbitrarily large batch. A single larger record still forms one span.
 const MAX_COALESCED_READ_BYTES: u64 = 1024 * 1024;
@@ -402,8 +409,7 @@ impl Segment {
         let mut records = Vec::new();
         let mut boundaries = Vec::new();
         let mut ids = Vec::with_capacity(epochs.len());
-        for epoch in epochs {
-            let written = write_epoch(&mut file, &temporary, offset, epoch, root_id)?;
+        for written in write_epoch_group(&mut file, &temporary, offset, epochs)? {
             ids.push(
                 written
                     .records
@@ -513,12 +519,10 @@ impl Segment {
             )
         })?;
         let mut offset = self.file_len;
-        let mut written_epochs = Vec::with_capacity(epochs.len());
-        for epoch in epochs {
-            let written = write_epoch(&mut self.file, &self.path, offset, epoch, root_id)?;
-            offset = written.end_offset;
-            written_epochs.push(written);
-        }
+        let written_epochs = write_epoch_group(&mut self.file, &self.path, offset, epochs)?;
+        offset = written_epochs
+            .last()
+            .map_or(offset, |written| written.end_offset);
         #[cfg(test)]
         crate::test_crash::inject_io("segment.append.sync_data").map_err(|error| {
             Error::io(
@@ -1009,16 +1013,29 @@ fn scan_epoch(file: &File, path: &Path, start: u64, file_len: u64) -> Result<Sca
     })
 }
 
-fn write_epoch(
-    file: &mut File,
+fn write_epoch_group<W: Write>(
+    file: &mut W,
     path: &Path,
     start: u64,
-    epoch: PreparedEpoch,
-    _root_id: RootId,
-) -> Result<WrittenEpoch> {
+    epochs: Vec<PreparedEpoch>,
+) -> Result<Vec<WrittenEpoch>> {
+    if epochs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut offset = start;
+    let mut pending = Vec::with_capacity(epochs.len());
+    for epoch in epochs {
+        let write = prepare_epoch_write(path, offset, epoch)?;
+        offset = write.end_offset;
+        pending.push(write);
+    }
+
     #[cfg(test)]
     if let Some(error) = crate::test_crash::injected_io_error("segment.epoch.short_write") {
-        file.write_all(&epoch.header[..epoch.header.len().div_ceil(2)])
+        let first = pending
+            .first()
+            .expect("segment writes contain at least one epoch");
+        file.write_all(&first.epoch.header[..first.epoch.header.len().div_ceil(2)])
             .map_err(|error| {
                 Error::io(
                     "write epoch header",
@@ -1034,26 +1051,51 @@ fn write_epoch(
             error,
         ));
     }
+
+    let slice_capacity = pending.iter().fold(0_usize, |total, write| {
+        total.saturating_add(
+            write
+                .epoch
+                .records
+                .len()
+                .saturating_mul(3)
+                .saturating_add(2),
+        )
+    });
+    let mut slices = Vec::with_capacity(slice_capacity);
+    for write in &pending {
+        slices.push(IoSlice::new(&write.epoch.header));
+        for (record, descriptor) in write.epoch.records.iter().zip(&write.epoch.descriptors) {
+            slices.push(IoSlice::new(descriptor));
+            if !record.metadata.is_empty() {
+                slices.push(IoSlice::new(&record.metadata));
+            }
+            if !record.payload.is_empty() {
+                slices.push(IoSlice::new(&record.payload));
+            }
+        }
+        slices.push(IoSlice::new(&write.commit));
+    }
+    write_all_vectored(file, path, &mut slices)?;
+    drop(slices);
+
+    Ok(pending
+        .into_iter()
+        .map(|write| WrittenEpoch {
+            records: write.records,
+            commit: write.commit,
+            end_offset: write.end_offset,
+        })
+        .collect())
+}
+
+fn prepare_epoch_write(path: &Path, start: u64, epoch: PreparedEpoch) -> Result<PendingEpochWrite> {
     let commit = EpochCommit {
         epoch_start: start,
         epoch_bytes: epoch.encoded_bytes,
         epoch_digest: epoch_digest(&epoch.header, &epoch.descriptors),
     }
     .encode();
-    let mut slices = Vec::with_capacity(epoch.records.len().saturating_mul(3).saturating_add(2));
-    slices.push(IoSlice::new(&epoch.header));
-    for (record, descriptor) in epoch.records.iter().zip(&epoch.descriptors) {
-        slices.push(IoSlice::new(descriptor));
-        if !record.metadata.is_empty() {
-            slices.push(IoSlice::new(&record.metadata));
-        }
-        if !record.payload.is_empty() {
-            slices.push(IoSlice::new(&record.payload));
-        }
-    }
-    slices.push(IoSlice::new(&commit));
-    write_all_vectored(file, path, &mut slices)?;
-    drop(slices);
 
     let mut offset = start
         .checked_add(EPOCH_HEADER_LEN)
@@ -1093,14 +1135,19 @@ fn write_epoch(
         .checked_add(EPOCH_COMMIT_LEN)
         .ok_or_else(|| Error::corruption(path, offset, "epoch end overflow"))?;
     debug_assert_eq!(end_offset.saturating_sub(start), epoch.encoded_bytes);
-    Ok(WrittenEpoch {
+    Ok(PendingEpochWrite {
+        epoch,
         records: stored,
         commit,
         end_offset,
     })
 }
 
-fn write_all_vectored(file: &mut File, path: &Path, slices: &mut [IoSlice<'_>]) -> Result<()> {
+fn write_all_vectored<W: Write>(
+    file: &mut W,
+    path: &Path,
+    slices: &mut [IoSlice<'_>],
+) -> Result<()> {
     // `File::write_vectored` writes a platform-supported prefix when the slice
     // count exceeds one syscall's iovec bound. Advancing that prefix also
     // handles ordinary partial writes without imposing a smaller fixed limit.
@@ -1186,4 +1233,67 @@ pub(super) fn validate_removed_segment_header(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        vectored_writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+            self.vectored_writes += 1;
+            let mut written = 0;
+            for slice in slices {
+                self.bytes.extend_from_slice(slice);
+                written += slice.len();
+            }
+            Ok(written)
+        }
+    }
+
+    #[test]
+    fn epoch_group_shares_one_vectored_write() {
+        let epochs = vec![
+            PreparedEpoch::new(
+                StreamId::new(1),
+                0,
+                vec![Record::new(Bytes::from_static(b"first"))],
+            )
+            .unwrap(),
+            PreparedEpoch::new(
+                StreamId::new(2),
+                0,
+                vec![Record::new(Bytes::from_static(b"second"))],
+            )
+            .unwrap(),
+        ];
+        let expected_bytes = epochs.iter().map(|epoch| epoch.encoded_bytes).sum::<u64>();
+        let mut writer = CountingWriter::default();
+
+        let written = write_epoch_group(&mut writer, Path::new("segment.log"), 0, epochs).unwrap();
+
+        assert_eq!(writer.vectored_writes, 1);
+        assert_eq!(u64::try_from(writer.bytes.len()).unwrap(), expected_bytes);
+        assert_eq!(written.len(), 2);
+        assert_eq!(
+            EpochCommit::decode(&written[1].commit).unwrap().epoch_start,
+            written[0].end_offset
+        );
+        assert_eq!(written[1].end_offset, expected_bytes);
+    }
 }
