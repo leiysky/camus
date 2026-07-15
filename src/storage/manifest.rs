@@ -37,6 +37,8 @@ pub(super) struct Manifest {
     root: PathBuf,
     path: PathBuf,
     file: File,
+    checkpoint_len: u64,
+    log_len: u64,
     pub(super) last_seq: u64,
 }
 
@@ -78,6 +80,9 @@ pub(super) fn create_initial(root: &Path, root_id: RootId) -> Result<()> {
 pub(super) fn recover(root: &Path, root_id: RootId) -> Result<ControlRecovery> {
     let checkpoint_path = root.join(CHECKPOINT_FILE);
     let checkpoint_bytes = read_complete_file(&checkpoint_path)?;
+    let checkpoint_len = u64::try_from(checkpoint_bytes.len()).map_err(|_| {
+        Error::corruption(&checkpoint_path, 0, "checkpoint length does not fit u64")
+    })?;
     let checkpoint = Checkpoint::decode(&checkpoint_bytes)
         .map_err(|error| Error::corruption(&checkpoint_path, 0, error.to_string()))?;
     if checkpoint.root_id != root_id {
@@ -286,6 +291,8 @@ pub(super) fn recover(root: &Path, root_id: RootId) -> Result<ControlRecovery> {
             root: root.to_path_buf(),
             path: log_path,
             file,
+            checkpoint_len,
+            log_len: file_len,
             last_seq,
         },
     })
@@ -396,17 +403,15 @@ fn truncate_tail(file: &mut File, path: &Path, length: u64) -> Result<()> {
 }
 
 impl Manifest {
-    pub(super) fn file_len(&self) -> Result<u64> {
-        self.file
-            .metadata()
-            .map(|metadata| metadata.len())
-            .map_err(|error| {
-                Error::io(
-                    "read manifest log metadata",
-                    &self.path,
-                    DurabilityOutcome::NotApplicable,
-                    error,
-                )
+    pub(super) fn file_len(&self) -> u64 {
+        self.log_len
+    }
+
+    pub(super) fn control_file_len(&self) -> Result<u64> {
+        self.checkpoint_len
+            .checked_add(self.log_len)
+            .ok_or_else(|| {
+                Error::corruption(&self.path, 0, "control file byte accounting overflow")
             })
     }
 
@@ -439,6 +444,22 @@ impl Manifest {
                     .ok_or(Error::ManifestSequenceExhausted)?;
             }
         }
+        let appended_bytes = frames.iter().try_fold(0_u64, |total, frame| {
+            total
+                .checked_add(u64::try_from(frame.len()).map_err(|_| {
+                    Error::corruption(
+                        &self.path,
+                        self.log_len,
+                        "manifest frame length does not fit u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    Error::corruption(&self.path, self.log_len, "manifest log length overflow")
+                })
+        })?;
+        let log_len = self.log_len.checked_add(appended_bytes).ok_or_else(|| {
+            Error::corruption(&self.path, self.log_len, "manifest log length overflow")
+        })?;
 
         self.file
             .seek(SeekFrom::End(0))
@@ -470,6 +491,7 @@ impl Manifest {
             .sync_data()
             .map_err(|error| Error::io("sync manifest log", &self.path, outcome, error))?;
         self.last_seq = *sequences.last().expect("nonempty sequence list");
+        self.log_len = log_len;
         Ok(sequences)
     }
 
@@ -483,6 +505,13 @@ impl Manifest {
         }
         let checkpoint_bytes = checkpoint.encode().map_err(|error| {
             Error::corruption(self.root.join(CHECKPOINT_FILE), 0, error.to_string())
+        })?;
+        let checkpoint_len = u64::try_from(checkpoint_bytes.len()).map_err(|_| {
+            Error::corruption(
+                self.root.join(CHECKPOINT_FILE),
+                0,
+                "checkpoint length does not fit u64",
+            )
         })?;
         atomic_replace(
             &self.root.join(CHECKPOINT_TEMP_FILE),
@@ -523,6 +552,8 @@ impl Manifest {
                 error,
             )
         })?;
+        self.checkpoint_len = checkpoint_len;
+        self.log_len = MANIFEST_LOG_HEADER_LEN;
         Ok(())
     }
 
