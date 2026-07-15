@@ -5,56 +5,60 @@
 **An embedded persistent buffer with at-least-once storage handoff.**
 
 Camus durably stages opaque records between application code and an external
-effect. It is purpose-built for local spools, embedded outboxes, upload
-staging, and durable write-behind workloads. Once an append succeeds, the
-record remains recoverable until its exact release is durable.
+effect. It is designed for local spools, embedded outboxes, upload staging,
+and durable write-behind workloads. Once an append succeeds, the record stays
+recoverable until its exact release is durable.
 
-## At a glance
+Camus is a storage primitive, not a message broker or general-purpose
+database. The embedding application owns delivery policy, worker
+coordination, retries, and downstream idempotency.
+
+## Why Camus
 
 - **Small lifecycle:** `append -> read -> release -> reclaim`.
-- **Logical multi-stream:** any number of lightweight stream namespaces share
-  efficient root-wide physical storage.
-- **Async readiness:** `Stream::read` waits for work and returns a non-empty,
-  owned, bounded snapshot; no callback or polling loop is required.
-- **Durable progress:** group commit amortizes syncs without weakening the
-  recovery outcome of an individual append or release.
+- **Waitable reads:** `Stream::read` waits asynchronously for work and returns
+  a non-empty, owned, bounded snapshot; no callback or polling loop is needed.
+- **Logical multi-stream:** lightweight stream handles share efficient
+  root-wide physical storage without exposing physical locations.
+- **Definitive success:** a successful append or release has crossed its
+  required durability barrier; group commit amortizes that barrier under load.
 - **Explicit pressure:** capacity is unbounded or globally bounded with
-  `Block` or `RejectNew`; pending data is never silently evicted.
-- **Application-neutral bytes:** metadata and payload remain opaque, and
-  physical locations never enter the public API.
+  `Block` or `RejectNew`; Camus never silently evicts pending data.
+- **Application-neutral bytes:** metadata and payload remain opaque immutable
+  bytes with no schema, routing, or serialization policy.
 
-Camus deliberately stops at the durable-buffer boundary. It is not a
-general-purpose KV database or message broker and provides no arbitrary
-queries, mutable records, networking, consumer ownership, retry scheduling,
-or exactly-once effects. The embedding application owns delivery policy and
-downstream idempotency.
-
-> **Compatibility commitment:** starting with `1.0.0-rc.1`, the public Rust API
-> follows Semantic Versioning and format-v1 roots remain readable by later
-> compatible releases. Incompatible persistent changes require a new explicit
-> format version and migration design. Earlier unpublished development roots
-> are outside this compatibility boundary.
+The guarantee is an **at-least-once storage handoff**. If the process stops
+after a downstream effect becomes durable but before release becomes durable,
+the record is returned again after recovery. Applications must make repeated
+effects safe when duplicates matter.
 
 ## Install
-
-Camus is available as a stable 1.0 release:
 
 ```toml
 [dependencies]
 camus = "1.0.0"
 ```
 
-The 1.0 production durability target is Linux on a validated local filesystem.
-macOS is supported as a development environment; see the
-[deployment envelope](#deployment-envelope) before production use.
+Camus 1.0's production durability target is Linux on a validated local
+filesystem. macOS is supported as a development environment; see
+[deployment and compatibility](#deployment-and-compatibility) before
+production use.
 
 ## Quick start
 
-The intended API composes directly in async application code:
+Potentially blocking storage operations are async. Handle construction and
+reactor-maintained observations are synchronous and never hide filesystem
+I/O.
 
 ```rust,no_run
-use bytes::Bytes;
 use camus::{Capacity, Config, FullPolicy, Log, ReadLimits, Record, StreamId};
+
+async fn make_downstream_effect_durable(
+    _record: &camus::PendingRecord,
+) -> camus::Result<()> {
+    // Persist the application-specific effect here.
+    Ok(())
+}
 
 async fn drain(root: &std::path::Path) -> camus::Result<()> {
     let log = Log::open(Config::new(
@@ -68,415 +72,217 @@ async fn drain(root: &std::path::Path) -> camus::Result<()> {
 
     let uploads = log.stream(StreamId::new(7));
     uploads
-        .append(Record {
-            metadata: Bytes::from_static(b"content-type: example"),
-            payload: Bytes::from_static(b"opaque payload"),
-        })
+        .append(
+            Record::new("opaque payload")
+                .with_metadata("idempotency-key=request-42"),
+        )
         .await?;
 
-    // read waits when this stream has no pending records. It never returns an
-    // empty snapshot merely to signal readiness.
+    // Waits while this stream has no pending records.
     let snapshot = uploads
-        .read(ReadLimits {
-            max_records: 128,
-            max_bytes: 8 * 1024 * 1024,
-        })
+        .read(ReadLimits::new(128, 8 * 1024 * 1024))
         .await?;
 
-    let mut completed = Vec::new();
-    for record in snapshot {
-        make_downstream_effect_durable(&record).await?;
+    let mut completed = Vec::with_capacity(snapshot.len());
+    for record in &snapshot {
+        make_downstream_effect_durable(record).await?;
         completed.push(record.id);
     }
-    uploads.release(completed).await?;
 
+    // Release only after the corresponding effects are durable.
+    uploads.release(completed).await?;
     log.shutdown().await
 }
 ```
 
-Runnable, compiled versions of this lifecycle are in [examples](examples/).
+Runnable versions of the lifecycle and its common variations are in
+[examples](examples/).
 
-## Core contract
+## Programming model
 
-- A storage root contains any number of caller-selected logical streams.
-- `StreamId` is a root-scoped `u64`; every value is valid and no stream is a
-  reserved default.
-- A stream is a logical namespace, not a directory, shard, rollover unit, I/O
-  lane, consumer, or subscription.
-- `append` and `append_batch` transfer owned opaque metadata and payload bytes
-  into one recoverable durability epoch.
-- Camus allocates a stable opaque 32-byte `RecordId` for each record. Physical
-  segment locations never enter the public API.
-- `Stream::read` waits asynchronously for pending work and returns a non-empty,
-  owned, bounded snapshot. Observation does not claim or remove records.
-- `Stream::release` durably removes an exact record subset from the shared
-  pending set. It is idempotent for records already released or reclaimed.
-- Reclamation is automatic. `Log::reclaim` lets an application explicitly
-  request and await the same maintenance when useful.
-- Capacity is configured once for the complete root as either unbounded or
-  bounded with `Block` or `RejectNew`; Camus has no per-stream quota.
+| Concept | Meaning |
+| --- | --- |
+| `Log` | One exclusively owned storage root and its async reactor |
+| `Stream` | A cheap, cloneable handle to a caller-selected logical namespace |
+| `Record` | Opaque metadata and payload owned as immutable `Bytes` |
+| `RecordId` | A stable opaque 32-byte storage identity used for exact release |
+| `PendingSnapshot` | A non-empty owned observation of currently pending records |
 
-The safe application flow is:
+A root may contain any number of streams. Every `u64` is a valid `StreamId`;
+there is no reserved default stream. Streams are independent logical
+sequences, but they are not directories, physical shards, consumers,
+subscriptions, claims, or I/O lanes.
 
-```text
-append record
-  -> read pending record
-  -> make the downstream effect durable
-  -> release record
-  -> Camus reclaims its physical segment when eligible
-```
+`Log`, `Stream`, and their clones are thread-safe clients of the same root
+reactor. A stream handle keeps the root alive, so applications may retain only
+the handles they need after setup. `RecordId` is for Camus identity and
+release, not physical addressing, ordering, or application deduplication.
 
-If a process stops after the downstream effect but before release becomes
-durable, recovery returns the record again. Applications must make repeated
-effects safe when that matters.
+### Append and ordering
 
-## API overview
+`Stream::append` and `Stream::append_batch` transfer owned records into one
+recoverable epoch per call. A successful append means the complete epoch and
+its commit marker were covered by a successful data sync.
 
-Potentially blocking storage work is async. Methods that only construct a
-handle or copy reactor-maintained state are synchronous and never perform
-hidden filesystem I/O.
+Records retain input order within a batch and reactor serialization order
+across batches on the same stream. Camus exposes no cross-stream ordering.
+Consecutive append or release units may share one durability barrier, but
+group commit never merges their individual recovery outcomes.
 
-```rust
-pub enum Capacity {
-    Unbounded,
-    Bounded {
-        total_bytes: u64,
-        when_full: FullPolicy,
-    },
-}
+### Wait, read, and release
 
-pub enum FullPolicy {
-    Block,
-    RejectNew,
-}
+`Stream::read` is both the readiness and read API. It waits outside reactor
+admission while a stream is empty, then returns a non-empty snapshot bounded
+by record count and total payload bytes. It selects the longest fitting prefix
+of pending stream order and verifies metadata and payload checksums before
+returning it.
 
-impl Config {
-    pub fn new(root: impl Into<PathBuf>, capacity: Capacity) -> Self;
+Reading observes shared pending state; it does not claim or remove records.
+Multiple handles may see the same records, and they are not independent
+consumers. One durable release removes a record from future reads for every
+handle on that stream. Applications that need claims, leases, per-subscriber
+delivery, or exclusive workers coordinate them above Camus.
 
-    // Configurable execution bounds include segment bytes, optional segment
-    // age, epoch bytes, release record count, commit-group count and bytes,
-    // command-queue capacity, optional detailed timing, and an optional
-    // Arc<dyn Runtime>.
-}
+`Stream::release` durably removes an exact set of record IDs. Duplicate IDs and
+already released or reclaimed IDs are successful no-ops. A release succeeds
+only after its manifest record crosses a durability barrier. Always make the
+external effect durable before releasing its record.
 
-impl Log {
-    pub async fn open(config: Config) -> Result<Self>;
-    pub fn stream(&self, id: StreamId) -> Stream;
-    pub fn known_streams(&self) -> Vec<StreamId>;
-    pub fn stats(&self) -> RootStats;
-    pub fn health(&self) -> RootHealth;
-    pub fn watch_health(&self) -> HealthWatch;
-    pub async fn reclaim(&self) -> Result<ReclaimReport>;
-    pub async fn shutdown(&self) -> Result<()>;
-}
+### Capacity and reclamation
 
-impl HealthWatch {
-    pub fn current(&self) -> RootHealth;
-    pub async fn changed(&mut self) -> Option<RootHealth>;
-}
+Capacity is configured once for the whole root:
 
-impl Stream {
-    pub fn id(&self) -> StreamId;
-    pub fn stats(&self) -> StreamStats;
-    pub async fn append(&self, record: Record) -> Result<RecordId>;
-    pub async fn append_batch(
-        &self,
-        records: Vec<Record>,
-    ) -> Result<Vec<RecordId>>;
-    pub async fn read(&self, limits: ReadLimits) -> Result<PendingSnapshot>;
-    pub async fn release(&self, ids: Vec<RecordId>) -> Result<()>;
-}
-```
+- `Capacity::Unbounded` imposes no Camus byte budget.
+- `FullPolicy::Block` waits asynchronously for capacity while reads, releases,
+  and maintenance continue to make progress.
+- `FullPolicy::RejectNew` returns a typed admission error so the application
+  can retry or spill elsewhere.
 
-`Log`, `Stream`, and their clones are thread-safe clients of one root reactor.
-A `Stream` keeps the root alive, so applications may retain only stream
-handles after setup. Explicit shutdown closes the shared lifecycle; surviving
-handles then return a closed error.
+Neither bounded policy evicts existing records. Camus capacity accounts for
+its exact encoded files and maintenance headroom; it is not a substitute for
+filesystem free-space or quota monitoring.
 
-`Record` and `PendingRecord` own metadata and payload as immutable `Bytes`.
-Moving a record across the reactor boundary does not cause an undocumented
-deep copy. A pending record contains its `RecordId`, metadata, and payload, and
-the snapshot can outlive the read Future.
+All streams share one physical segment sequence. Segment size is a hard bound,
+while optional age rollover is a soft reactor deadline. Reclamation runs
+automatically after every record in a segment has been released;
+`Log::reclaim` is an optional maintenance barrier, not a correctness
+requirement. Because streams may interleave in a segment, a slow stream can
+temporarily pin released bytes belonging to another stream.
 
-`RecordId` implements copy, equality, and hashing and has a fixed 32-byte
-serialization. It is useful for storage identity and release, not ordering,
-physical addressing, or application deduplication. Applications put their own
-idempotency keys in opaque metadata.
+### Runtime, cancellation, and failure
 
-Configuration requires an explicit `Capacity`. Other operational limits have
-documented, configurable defaults and may be tuned from benchmarks without
-changing format-v1 semantics.
+Camus runs one async reactor per open root and at most one finite storage job
+per root. By default it lazily creates one process-wide private Tokio runtime.
+Applications that need executor isolation can provide an `Arc<dyn Runtime>`.
 
-An absent `max_segment_age` disables age rollover. `known_streams` and stats
-are concurrent in-memory snapshots; they do not imply a disk refresh. Root
-stats separate storage, pressure, logical-operation, durability-group,
-maintenance, and recovery state. Detailed pressure stats separate command
-queue admission from reactor dispatch time and split finite filesystem jobs by
-append, read, release, reclaim, and timer-driven rollover. Health is a separate
-low-frequency lifecycle view.
+Cancellation before admission is side-effect-free. After admission, dropping
+an append or release Future abandons only its result; recovery may still find
+the operation durable.
 
-## Read and release semantics
+Expected validation and admission errors do not poison a root. An I/O error
+after admission, authoritative corruption, a body-checksum failure, or a
+runtime failure does. A mutating operation then reports an unknown durability
+outcome: the error is not proof that the mutation is absent. Close all
+handles, reopen the root, and reconcile from recovered pending records.
 
-`ReadLimits` contains a hard record-count limit and a hard payload-byte limit.
-A read selects the longest fitting prefix of that stream's pending logical
-sequence, skipping released gaps but never skipping the earliest pending
-record to find smaller later work. Metadata bytes are returned but do not
-count toward `max_bytes`; complete record size remains bounded by the root's
-epoch limit.
+Use `Log::shutdown` as the synchronization barrier before copying, replacing,
+or immediately reopening a root. Final-handle drop starts background shutdown
+but is not such a barrier.
 
-If the earliest record alone exceeds `max_bytes`, read returns a typed error
-containing its ID, required payload bytes, and configured bytes. It never
-silently violates the limit. Before returning, Camus verifies both metadata
-and payload checksums for every selected record. One mismatch fails the whole
-read with no partial snapshot and poisons the open root.
+### Observability
 
-When no record is pending, read waits outside reactor admission. After being
-woken it admits one bounded storage read. If another handle releases all of
-that work first, the operation waits again rather than returning an empty
-snapshot.
+`Log::stats`, `Stream::stats`, `Log::health`, and `Log::known_streams` return
+reactor-maintained in-memory snapshots. `HealthWatch::changed` provides prompt,
+coalescing lifecycle notification without turning health into a record event
+stream. `Stream::read` remains the data-readiness Future.
 
-Multiple handles may read the same pending records concurrently. They do not
-represent independent consumers: one durable release removes a record from
-future snapshots for every handle on that stream. Applications that need
-claims, leases, per-subscriber copies, or ownership coordination build them
-above Camus.
+Camus exposes structured counters, gauges, duration totals/maxima, health, and
+stable low-cardinality error kinds. It deliberately does not choose a metrics,
+logging, tracing, or exporter framework. Detailed per-operation and
+per-storage-job timing is opt-in to keep the default fast path lean.
 
-One release call is an atomic ensure-not-pending operation for its currently
-pending subset. Duplicate IDs and IDs already released or reclaimed are
-successful no-ops. Scope errors and unknown future IDs are rejected before
-admission. Every root has a configurable hard `max_release_records`; Camus
-never silently splits a larger release into weaker atomic units.
+## Fit and non-goals
 
-## Ordering and durability
-
-Within one stream, records retain input order inside an append batch and the
-reactor's serialization order across batches. Released gaps are skipped
-without reordering the remainder. Camus exposes no cross-stream order and does
-not equate read order with consumer execution or completion order.
-
-Each append request is one independent recovery epoch. Each release request's
-newly pending subset is one independent release unit. The reactor may group
-consecutive units of the same kind behind one storage sync, but group commit
-does not merge their atomic recovery outcomes.
-
-Append success means the epoch's complete record bytes and commit marker were
-covered by a successful data durability barrier. Release success means its
-manifest frame was covered by a successful manifest durability barrier.
-Commands that arrive during a sync join a later group; Camus adds no fixed
-linger delay at low load.
-
-## Capacity, rollover, and reclamation
-
-For a bounded root, `Block` waits asynchronously for admissible capacity while
-leaving read, release, and maintenance able to run. `RejectNew` returns a typed
-not-admitted error. A request that can never fit fails immediately under either
-policy. Neither policy evicts pending data or reports false durable success.
-
-Capacity charges exact encoded lengths of Camus format files, including
-framing, control metadata, released bytes not yet reclaimed, and transactional
-temporary files. It does not model filesystem allocation blocks or reserve the
-device's free space. Camus keeps non-configurable dynamic headroom for a
-checkpoint rewrite, the largest next manifest frame, and an active segment's
-seal footer so release and reclamation can still make progress.
-
-Physical data uses one root-wide segment sequence shared by every logical
-stream. Segment size is a hard limit; a complete epoch never crosses a
-segment. Optional maximum segment age, disabled by default, is a reactor-driven
-soft rollover deadline, not a real-time or retention guarantee. The timer can
-seal an idle non-empty segment without an application callback. Camus creates
-no empty replacement; the next append creates a segment lazily.
-
-A segment is physically removed only after every record it contains is
-released. Interleaving streams therefore means one slow stream may pin
-released bytes from another stream. This is an accepted initial tradeoff;
-future dynamic sharding or relocation may improve it without changing the
-logical API.
-
-Reclamation runs automatically at low priority and is promoted when blocked
-appends need capacity. `Log::reclaim` exists for explicit observability and
-tests, not for correctness.
-
-## Runtime and performance contract
-
-Camus starts one async reactor task per open root. The reactor owns admission,
-the bounded command queue, group selection, timers, and in-memory state. Each
-finite filesystem job runs through the runtime's blocking facility, with at
-most one storage job executing per root. Different roots may make progress in
-parallel.
-
-When no runtime is supplied, Camus lazily creates one process-wide private
-Tokio runtime and retains it until process exit. Applications that require
-scheduler isolation may configure an `Arc<dyn Runtime>`. Tokio types do not
-appear in storage-domain values or Futures.
-
-Admitted foreground operations execute FIFO. Only consecutive same-kind
-commit units at the queue head may be grouped; a read or change of kind is a
-barrier. Automatic maintenance is lower priority unless capacity progress
-requires it.
-
-Cancellation before operation admission is side-effect-free. After admission,
-the reactor owns the operation through completion; dropping its Future only
-abandons the result. A cancelled append or release may therefore be recovered
-as durable even though its caller observed no result.
-
-## Failure model
-
-Expected pre-mutation errors do not poison a root. These include invalid
-configuration or input, lock contention, closure, capacity rejection,
-requests over configured limits, insufficient read limits, record-ID scope or
-existence errors, and exhausted identifiers.
-
-An I/O error after admission, authoritative corruption, lazy body-checksum
-failure, or runtime failure poisons the open root. The triggering operation
-returns its precise error. A mutating operation reports that its durable
-outcome is unknown; failure is not proof that the mutation is absent. Queued
-and future storage operations return `Poisoned`, while in-memory stats and
-shutdown remain available.
-
-Recovery is close and reopen. The reopened root validates durable bytes and
-decides which complete operations survived. Camus has no in-place reset or
-continue-after-poison mode.
-
-## Observability boundary
-
-`Log::stats` and `Stream::stats` are synchronous, in-memory snapshots. Root
-counters are scoped to one successful open and saturate instead of wrapping.
-Base gauges, counters, real wait durations, and recovery duration are always
-available. `Config::with_detailed_observability` additionally measures
-end-to-end logical calls and storage jobs; it is disabled by default to keep
-the fast path lean.
-
-`Log::health` reports `Running`, `ShuttingDown`, `Poisoned`, or `Closed` and
-retains the first failed-closed cause. `HealthWatch::changed` provides prompt,
-coalescing async notification without owning the root or backpressuring its
-reactor. It is not a record-delivery event stream; `Stream::read` remains the
-readiness Future.
-
-Returned errors expose a stable low-cardinality `ErrorKind`. Camus does not
-choose metric names, automatically label by stream ID, or depend on a logging,
-tracing, metrics, or exporter framework. See the
-[observability guide](docs/observability.md) for counter semantics and adapter
-guidance.
-
-## Use cases and non-goals
-
-Camus fits local spools, embedded outboxes, upload staging, and durable
-write-behind buffers where the application wants a small persistent handoff
-boundary.
+Camus fits a single-process local spool, embedded outbox, upload staging area,
+or durable write-behind buffer when the application wants a small persistent
+handoff boundary.
 
 Camus intentionally does not provide:
 
 - application schemas, serialization, filtering, indexes, or mutable records;
-- record-delivery callbacks or subscriptions, consumers, claims, leases, or
-  retry scheduling;
-- per-subscriber delivery or per-stream capacity fairness;
-- exactly-once delivery, application deduplication, or distributed
+- callbacks, subscriptions, consumers, claims, leases, or retry scheduling;
+- per-subscriber delivery, per-stream quotas, or capacity fairness;
+- exactly-once effects, application deduplication, or distributed
   transactions;
-- network protocols, HTTP handlers, service routing, clustering, or
-  replication; or
-- database redo/undo or an externally visible physical log sequence number.
+- networking, routing, clustering, or replication; or
+- database redo/undo and arbitrary key-value queries.
 
-## Storage layout and compatibility
+Use separate roots or application-level admission when workloads need hard
+tenant isolation. Use a broker when delivery ownership and subscriber state
+must be part of the storage product. Use a database when records need mutable
+lookup and query semantics.
 
-Logical streams do not have physical directories. Format v1 uses one root
-identity, one checkpoint/log pair, and one shared segment directory:
+## Deployment and compatibility
 
-```text
-<root>/
-  ROOT
-  camus.lock
-  MANIFEST.chk
-  MANIFEST.log
-  segments/
-    segment-00000000000000000000.log
-    ...
-```
+Camus 1.x follows Semantic Versioning. Format v1 is the persistent
+compatibility boundary: later compatible releases remain able to read these
+roots, while an incompatible layout or interpretation requires an explicit
+new format version and migration design. Earlier unpublished development
+roots are outside this boundary.
 
-Every authoritative artifact carries the immutable random 128-bit root ID.
-XXH3-64 checksums use the fixed format-v1 seed `CAMUSV1!`; they detect
-accidental corruption and are not authentication.
+The supported production envelope is a Linux local filesystem that honors
+file data sync, directory sync, exclusive advisory locking, and atomic
+same-directory rename. Network, userspace, and layered filesystems require
+independent validation. One process owner opens a root at a time.
 
-The exact layouts and compatibility boundary are defined in
-[docs/file-format.md](docs/file-format.md). Filesystem ordering, recovery,
-release, and reclamation invariants are defined in
-[docs/architecture.md](docs/architecture.md). Unsupported or ambiguous
-authoritative data fails closed.
+Back up a root after explicit shutdown, or take one atomic snapshot of the
+whole root. Do not copy a live root file by file. Checksums detect accidental
+corruption; they do not authenticate data against an attacker who can rewrite
+bytes and recompute them.
 
-Release `1.0.0-rc.1` establishes format v1 as the published compatibility
-boundary. Earlier unpublished development roots are not migration inputs.
-Starting with this candidate, changing a magic, field, checksum range, codec,
-or semantic interpretation requires an explicit new format version and
-migration design.
-
-## Deployment envelope
-
-Camus 1.0 targets Linux local filesystems that honor file data sync, directory
-sync, exclusive advisory locking, and atomic same-directory rename. macOS is a
-development environment, not part of the production durability support matrix
-or required CI and release qualification. A network, userspace, or layered
-filesystem is outside the durability envelope unless its behavior has been
-independently validated.
-
-One process owner opens a root at a time. Back up a closed root or use an
-atomic filesystem snapshot; do not copy a live root file by file. Checksums do
-not protect against an attacker who can rewrite bytes and recompute them.
+The normative byte layouts and compatibility rules are in the
+[file-format specification](docs/file-format.md). Filesystem ordering,
+recovery, release, and reclamation invariants are in the
+[architecture specification](docs/architecture.md).
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): execution, durability, recovery,
-  release, and reclamation invariants.
-- [File format](docs/file-format.md): normative format-v1 byte layouts and
-  codecs.
+- [API reference][docs]: crate overview, core types, and method-level
+  contracts.
 - [Usage guide](docs/usage.md): API composition, capacity, cancellation, and
   shutdown.
-- [Operations guide](docs/operations.md): supported deployment and failure
-  response.
-- [Observability guide](docs/observability.md): snapshots, counter semantics,
+- [Operations guide](docs/operations.md): deployment, pressure, backup, and
+  failure response.
+- [Architecture](docs/architecture.md): runtime, durability, recovery,
+  release, and reclamation invariants.
+- [File format](docs/file-format.md): normative format-v1 layouts, checksums,
+  codecs, and compatibility.
+- [Observability guide](docs/observability.md): snapshot and counter semantics,
   health transitions, and adapter guidance.
-- [Benchmark guide](docs/benchmarks.md): reproducible durable-buffer workloads,
-  comparison-engine mappings, and regression comparison.
-- [Long-running smoke guide](docs/long-running-smoke.md): cyclic capacity
-  pressure, latency telemetry, VictoriaMetrics reporting, and pass criteria.
-- [Release guide](docs/releasing.md): RC qualification, compatibility gates,
-  required repository settings, packaging, publication, and rollback.
+- [Benchmark guide](docs/benchmarks.md): reproducible workloads and comparison
+  results.
+- [Long-running smoke guide](docs/long-running-smoke.md): capacity cycling,
+  latency telemetry, and pass criteria.
 - [Runnable examples](examples/README.md): replay, waiting reads, multi-stream
   use, maintenance, and observability.
+- [Release guide](docs/releasing.md): qualification, packaging, publication,
+  and rollback.
 
 ## Development
 
-Before publishing, run:
+The normal local gate is:
 
 ```sh
 cargo fmt --all --check
-cargo fmt --all --check --manifest-path fuzz/Cargo.toml
-cargo fmt --all --check --manifest-path benchmarks/Cargo.toml
-cargo fmt --all --check --manifest-path smoke/Cargo.toml
 cargo clippy --locked --all-targets -- -D warnings
-cargo clippy --locked --manifest-path smoke/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --lib --tests
-cargo test --locked --release --lib --tests
 cargo test --locked --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo check --locked --manifest-path fuzz/Cargo.toml
-cargo test --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine
-cargo test --locked --manifest-path smoke/Cargo.toml
-cargo audit --deny warnings
-cargo audit --deny warnings --file fuzz/Cargo.lock
-cargo audit --deny warnings --file benchmarks/Cargo.lock
-cargo audit --deny warnings --file smoke/Cargo.lock
-cargo deny --locked check -A license-not-encountered licenses sources
-cargo deny --locked --manifest-path fuzz/Cargo.toml check licenses sources
-cargo deny --locked --manifest-path benchmarks/Cargo.toml --no-default-features --features redb-engine check -A license-not-encountered licenses sources
-cargo deny --locked --manifest-path smoke/Cargo.toml check -A license-not-encountered licenses sources
-cargo package --locked
-cargo publish --dry-run --locked
 ```
 
-Stable releases and release candidates additionally use the manual-only
-[`Release qualification`](docs/releasing.md#manual-release-qualification)
-workflow to validate candidate metadata, the applicable public-API baseline,
-and tests executed from Cargo's extracted package source. The workflow never
-publishes or tags a release.
+Fuzz, benchmark, smoke, supply-chain, package, and release qualification are
+kept as explicit workflows so normal development stays fast. See the
+[release guide](docs/releasing.md) for the complete publication gate.
 
 ## License
 
