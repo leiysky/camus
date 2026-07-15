@@ -7,9 +7,20 @@ version numbers.
 
 ## Unreleased
 
+## [1.0.0-rc.2] - 2026-07-15
+
 - Immutable format-v1 compatibility fixture written by the published
   `1.0.0-rc.1` registry artifact, with reopen, pending-state, release-state,
   append, and subsequent-reader tests.
+- Bounded reactor maintenance work, threshold-driven manifest compaction, and
+  storage-job latency telemetry, removing recurring steady-state latency spikes
+  without changing durability or format-v1 ordering.
+- Coalesced bounded record reads and vectored epoch writes, improving verified
+  reads and batch appends while retaining independent checksum validation and
+  the existing format-v1 byte layout.
+- Updated the directional Linux benchmark reference for the optimized storage
+  path, including reversed engine-order checks and immediate post-workload
+  storage-footprint context.
 
 ## [1.0.0-rc.1] - 2026-07-14
 
