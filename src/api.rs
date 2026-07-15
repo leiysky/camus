@@ -1496,10 +1496,10 @@ async fn reactor_loop(
                     .into_iter()
                     .collect::<Vec<_>>();
                 let units = entries
-                    .iter()
+                    .iter_mut()
                     .map(|(stream_id, ids, _, _)| ReleaseUnit {
                         stream_id: *stream_id,
-                        ids: ids.clone(),
+                        ids: std::mem::take(ids),
                     })
                     .collect();
                 let result = storage_job(

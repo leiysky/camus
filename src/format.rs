@@ -714,12 +714,17 @@ impl ManifestFrameHeader {
 }
 
 impl ManifestFrame {
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> FormatResult<Vec<u8>> {
-        if self.manifest_seq == 0 {
+        Self::encode_parts(self.manifest_seq, &self.body)
+    }
+
+    pub(crate) fn encode_parts(manifest_seq: u64, body: &ManifestBody) -> FormatResult<Vec<u8>> {
+        if manifest_seq == 0 {
             return Err(FormatError::new("manifest sequence must be nonzero"));
         }
-        let body = self.body.encode()?;
-        let body_len = u64::try_from(body.len())
+        let encoded_body = body.encode()?;
+        let body_len = u64::try_from(encoded_body.len())
             .map_err(|_| FormatError::new("manifest body length does not fit u64"))?;
         let total_len = MANIFEST_FRAME_HEADER_LEN
             .checked_add(body_len)
@@ -727,14 +732,14 @@ impl ManifestFrame {
         let mut bytes = Vec::with_capacity(usize_len(total_len, "manifest frame length")?);
         let mut header = [0_u8; MANIFEST_FRAME_HEADER_LEN as usize];
         header[..8].copy_from_slice(MANIFEST_FRAME_MAGIC);
-        write_u64(&mut header, 8, self.manifest_seq);
-        write_u64(&mut header, 16, self.body.kind());
+        write_u64(&mut header, 8, manifest_seq);
+        write_u64(&mut header, 16, body.kind());
         write_u64(&mut header, 24, body_len);
-        write_u64(&mut header, 32, checksum(&body));
+        write_u64(&mut header, 32, checksum(&encoded_body));
         let value = checksum(&header[..40]);
         write_u64(&mut header, 40, value);
         bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&encoded_body);
         Ok(bytes)
     }
 

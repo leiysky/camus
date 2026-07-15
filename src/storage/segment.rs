@@ -1,4 +1,6 @@
-use super::files::{read_exact_at, segment_path, segment_temporary_path, sync_directory};
+use super::files::{
+    read_exact_at, segment_path, segment_temporary_path, sync_directory, write_all_vectored,
+};
 use crate::error::{DurabilityOutcome, Error, Result};
 use crate::format::{
     checksum, epoch_digest, segment_digest, EpochCommit, EpochHeader, RecordDescriptor,
@@ -9,7 +11,9 @@ use crate::model::{PendingRecord, Record, RecordId, RootId, StreamId};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IoSlice, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io;
+use std::io::{IoSlice, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -1083,7 +1087,13 @@ fn write_epoch_group<W: Write>(
         }
         slices.push(IoSlice::new(&write.commit));
     }
-    write_all_vectored(file, path, &mut slices)?;
+    write_all_vectored(
+        file,
+        path,
+        &mut slices,
+        "write epoch",
+        DurabilityOutcome::Unknown,
+    )?;
     drop(slices);
 
     Ok(pending
@@ -1148,40 +1158,6 @@ fn prepare_epoch_write(path: &Path, start: u64, epoch: PreparedEpoch) -> Result<
         commit,
         end_offset,
     })
-}
-
-fn write_all_vectored<W: Write>(
-    file: &mut W,
-    path: &Path,
-    slices: &mut [IoSlice<'_>],
-) -> Result<()> {
-    // `File::write_vectored` writes a platform-supported prefix when the slice
-    // count exceeds one syscall's iovec bound. Advancing that prefix also
-    // handles ordinary partial writes without imposing a smaller fixed limit.
-    let mut remaining = slices;
-    while !remaining.is_empty() {
-        match file.write_vectored(remaining) {
-            Ok(0) => {
-                return Err(Error::io(
-                    "write epoch",
-                    path,
-                    DurabilityOutcome::Unknown,
-                    io::Error::new(io::ErrorKind::WriteZero, "failed to write whole epoch"),
-                ));
-            }
-            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => {
-                return Err(Error::io(
-                    "write epoch",
-                    path,
-                    DurabilityOutcome::Unknown,
-                    error,
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn repair_tail(file: &mut File, path: &Path, length: u64) -> Result<()> {

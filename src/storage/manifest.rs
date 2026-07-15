@@ -1,6 +1,6 @@
 use super::files::{
-    atomic_replace, read_complete_file, read_exact_at, CHECKPOINT_FILE, CHECKPOINT_TEMP_FILE,
-    MANIFEST_LOG_FILE, MANIFEST_LOG_TEMP_FILE,
+    atomic_replace, read_complete_file, read_exact_at, write_all_vectored, CHECKPOINT_FILE,
+    CHECKPOINT_TEMP_FILE, MANIFEST_LOG_FILE, MANIFEST_LOG_TEMP_FILE,
 };
 use crate::error::{DurabilityOutcome, Error, Result};
 use crate::format::{
@@ -11,7 +11,7 @@ use crate::format::{
 use crate::model::{RootId, StreamId};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{IoSlice, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -419,25 +419,19 @@ impl Manifest {
         &mut self,
         bodies: &[ManifestBody],
         outcome: DurabilityOutcome,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<()> {
         if bodies.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let mut next = self
             .last_seq
             .checked_add(1)
             .ok_or(Error::ManifestSequenceExhausted)?;
         let mut frames = Vec::with_capacity(bodies.len());
-        let mut sequences = Vec::with_capacity(bodies.len());
         for body in bodies {
-            let frame = ManifestFrame {
-                manifest_seq: next,
-                body: body.clone(),
-            }
-            .encode()
-            .map_err(|error| Error::corruption(&self.path, 0, error.to_string()))?;
+            let frame = ManifestFrame::encode_parts(next, body)
+                .map_err(|error| Error::corruption(&self.path, 0, error.to_string()))?;
             frames.push(frame);
-            sequences.push(next);
             if frames.len() < bodies.len() {
                 next = next
                     .checked_add(1)
@@ -464,25 +458,35 @@ impl Manifest {
         self.file
             .seek(SeekFrom::End(0))
             .map_err(|error| Error::io("seek manifest log", &self.path, outcome, error))?;
-        for frame in &frames {
-            #[cfg(test)]
-            if let Some(error) = crate::test_crash::injected_io_error("manifest.frame.short_write")
-            {
-                self.file
-                    .write_all(&frame[..frame.len().div_ceil(2)])
-                    .map_err(|error| {
-                        Error::io("write manifest frame", &self.path, outcome, error)
-                    })?;
-                return Err(Error::io(
-                    "write manifest frame",
-                    &self.path,
-                    outcome,
-                    error,
-                ));
-            }
+        #[cfg(test)]
+        if let Some(error) = crate::test_crash::injected_io_error("manifest.frame.short_write") {
+            let frame = frames.first().expect("manifest group contains a frame");
+            self.file
+                .write_all(&frame[..frame.len().div_ceil(2)])
+                .map_err(|error| Error::io("write manifest frame", &self.path, outcome, error))?;
+            return Err(Error::io(
+                "write manifest frame",
+                &self.path,
+                outcome,
+                error,
+            ));
+        }
+        if let [frame] = frames.as_slice() {
             self.file
                 .write_all(frame)
                 .map_err(|error| Error::io("write manifest frame", &self.path, outcome, error))?;
+        } else {
+            let mut slices = frames
+                .iter()
+                .map(|frame| IoSlice::new(frame))
+                .collect::<Vec<_>>();
+            write_all_vectored(
+                &mut self.file,
+                &self.path,
+                &mut slices,
+                "write manifest frame",
+                outcome,
+            )?;
         }
         #[cfg(test)]
         crate::test_crash::inject_io("manifest.append.sync_data")
@@ -490,9 +494,9 @@ impl Manifest {
         self.file
             .sync_data()
             .map_err(|error| Error::io("sync manifest log", &self.path, outcome, error))?;
-        self.last_seq = *sequences.last().expect("nonempty sequence list");
+        self.last_seq = next;
         self.log_len = log_len;
-        Ok(sequences)
+        Ok(())
     }
 
     pub(super) fn compact(&mut self, checkpoint: &Checkpoint) -> Result<()> {
