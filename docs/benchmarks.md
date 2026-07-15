@@ -20,21 +20,37 @@ configuration deliberately.
 
 ## Directional Linux reference
 
-The following five-sample Linux/ext4 result uses the baseline profile and a
-4 KiB payload. It is a directional comparison, not a universal target or CI
-gate. Except for warm restart, each engine cell is `records/s · p99 ms`;
-warm-restart cells are `p50 / p99 ms`.
+The following five-sample Linux/ext4 result uses the baseline profile, a 4 KiB
+payload, and storage revision `3d78162`. The engines ran as simple append file,
+redb, RocksDB, then Camus. It is a directional comparison, not a universal
+target or CI gate. Except for warm restart, each engine cell is
+`records/s · p99 ms`; warm-restart cells are `p50 / p99 ms`.
 
 | Workload | Camus | Simple append file | RocksDB | redb | Conclusion |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Sequential durable append | 874 · 1.834 | 1,056 · 1.564 | 1,071 · 1.522 | 902 · 1.914 | Camus trails the minimal file and RocksDB by about 17–18%. |
-| Concurrent append, 1 stream | 8,258 · 3.222 | 1,104 · 27.918 | 6,769 · 3.498 | 868 · 37.683 | Camus leads throughput and p99 latency; its group commit is effective. |
-| Concurrent append, 16 streams | 7,307 · 3.273 | 1,130 · 17.826 | 6,657 · 3.740 | 872 · 35.553 | Logical stream fan-out adds little physical I/O cost for Camus. |
-| Append batches of 64 | 33,797 · 2.787 | 43,649 · 2.218 | 33,439 · 2.783 | 23,483 · 4.235 | Camus and RocksDB are effectively level; the minimal file sets the lower-overhead reference. |
-| Cached verified read | 196,896 · 66.912 | 188,801 · 50.921 | 258,424 · 37.356 | 300,655 · 30.654 | RocksDB and redb lead; Camus read-path work remains an optimization target. |
-| Release batches of 256 | 225,984 · 2.114 | 251,132 · 1.571 | 221,507 · 2.030 | 208,969 · 2.365 | All four are in the same throughput range; the simple file has the lowest p99. |
-| Read/release drain | 109,871 · 3.672 | 133,881 · 2.992 | 140,549 · 2.628 | 144,440 · 2.853 | Camus trails the comparison engines on end-to-end drain. |
-| Warm restart, first batch | 23.904 / 26.477 | 18.924 / 19.186 | 290.980 / 314.835 | 1.715 / 2.043 | Camus restarts far faster than RocksDB but slower than the simpler formats. |
+| Sequential durable append | 941 · 1.670 | 1,122 · 1.208 | 1,083 · 1.373 | 922 · 1.501 | The minimal file leads; Camus trails RocksDB by about 13% without group-commit opportunity. |
+| Concurrent append, 1 stream | 13,014 · 1.835 | 1,199 · 25.166 | 7,454 · 2.742 | 972 · 27.607 | Camus leads RocksDB by about 75%; its group commit is effective. |
+| Concurrent append, 16 streams | 12,265 · 2.372 | 1,188 · 17.433 | 7,375 · 2.906 | 956 · 33.047 | Camus leads RocksDB by about 66%; logical stream fan-out adds little physical I/O cost. |
+| Append batches of 64 | 42,621 · 2.146 | 46,687 · 1.860 | 37,791 · 2.181 | 26,283 · 3.328 | The minimal file leads; Camus is about 13% ahead of RocksDB with similar p99. |
+| Cached verified read | 292,893 · 29.000 | 184,168 · 50.430 | 268,880 · 38.732 | 212,628 · 44.827 | Camus leads throughput and has about 25% lower p99 than RocksDB. |
+| Release batches of 256 | 255,167 · 1.363 | 266,945 · 2.146 | 246,433 · 1.571 | 227,529 · 2.074 | The minimal file has the highest throughput; Camus has the lowest p99. |
+| Read/release drain | 167,844 · 1.944 | 148,223 · 2.273 | 151,590 · 2.226 | 163,507 · 2.474 | Camus leads end-to-end drain, with redb close on throughput. |
+| Warm restart, first batch | 18.776 / 20.136 | 17.138 / 17.203 | 262.013 / 266.469 | 1.563 / 2.179 | redb is fastest; Camus is about 14× faster than RocksDB and close to the minimal file. |
+
+Two additional five-sample Camus/RocksDB passes reversed the engine order to
+check order sensitivity. Across all three current runs, the winner stayed the
+same although the margin varied: Camus trailed sequential durable append by
+9–13%, led one-stream concurrent append by 14–75%, led 16-stream concurrent
+append by 66–80%, led batch append by 13–21%, led verified read by 9–56%, led
+release by 3–8%, and led drain by 11–29%. Camus's warm-restart first-batch p50
+was 13–14× faster than RocksDB's. The variability, especially for cached read,
+is why these numbers are directional rather than release thresholds.
+
+After the release and drain workloads, the median measured storage footprint
+was 176 bytes for Camus, about 12.2 MiB for redb, and about 32.7 MiB for both
+the simple append file and RocksDB. This is the immediate post-workload file
+length, not a post-compaction RocksDB claim: the harness does not force a
+RocksDB compaction after its synchronous deletes.
 
 ## Compared engines and semantic mapping
 
