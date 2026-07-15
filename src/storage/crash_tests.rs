@@ -451,7 +451,11 @@ fn crash_child() {
     match scenario.as_str() {
         "create" | "append" => append(&mut storage, Bytes::from_static(b"child")),
         "seal" => append(&mut storage, Bytes::from(vec![0xa5; 300])),
-        "release" | "compact" => release_all(&mut storage),
+        "release" => release_all(&mut storage),
+        "compact" => {
+            release_all(&mut storage);
+            storage.compact_manifest().unwrap();
+        }
         "reclaim" => {
             storage.reclaim(ReclaimKind::Explicit).unwrap();
         }
@@ -471,7 +475,8 @@ fn fault_child() {
     let result = match scenario.as_str() {
         "create" | "append" => append_result(&mut storage, Bytes::from_static(b"child")),
         "seal" => append_result(&mut storage, Bytes::from(vec![0xa5; 300])),
-        "release" | "compact" => release_all_result(&mut storage),
+        "release" => release_all_result(&mut storage),
+        "compact" => release_all_result(&mut storage).and_then(|()| storage.compact_manifest()),
         "reclaim" => storage.reclaim(ReclaimKind::Explicit).map(|_| ()),
         _ => panic!("unknown fault scenario: {scenario}"),
     };

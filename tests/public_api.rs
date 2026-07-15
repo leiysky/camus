@@ -379,6 +379,12 @@ async fn root_observability_separates_calls_commits_and_maintenance() {
     assert_eq!(stats.commits.release_units, 1);
     assert_eq!(stats.commits.release_records, 2);
     assert!(stats.pressure.storage_job_elapsed.observations >= 4);
+    assert!(stats.pressure.reactor_dispatch_wait.observations >= 4);
+    assert_eq!(stats.pressure.storage_jobs.append.observations, 1);
+    assert_eq!(stats.pressure.storage_jobs.read.observations, 1);
+    assert_eq!(stats.pressure.storage_jobs.release.observations, 1);
+    assert!(stats.pressure.storage_jobs.reclaim.observations >= 1);
+    assert_eq!(stats.pressure.storage_jobs.segment_rollover.observations, 0);
     assert_eq!(stats.maintenance.explicit_reclaim_passes, 1);
     assert_eq!(stats.maintenance.reclaimed_segments, 1);
     assert_eq!(stats.pressure.queue_wait.waits, 0);
@@ -402,6 +408,8 @@ async fn default_observability_counts_without_detailed_call_timing() {
     assert_eq!(stats.operations.append.elapsed.observations, 0);
     assert_eq!(stats.commits.append_groups, 1);
     assert_eq!(stats.pressure.storage_job_elapsed.observations, 0);
+    assert_eq!(stats.pressure.reactor_dispatch_wait.observations, 0);
+    assert_eq!(stats.pressure.storage_jobs.append.observations, 0);
     log.shutdown().await.unwrap();
 }
 

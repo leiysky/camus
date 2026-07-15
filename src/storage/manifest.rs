@@ -396,6 +396,20 @@ fn truncate_tail(file: &mut File, path: &Path, length: u64) -> Result<()> {
 }
 
 impl Manifest {
+    pub(super) fn file_len(&self) -> Result<u64> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|error| {
+                Error::io(
+                    "read manifest log metadata",
+                    &self.path,
+                    DurabilityOutcome::NotApplicable,
+                    error,
+                )
+            })
+    }
+
     pub(super) fn append_group(
         &mut self,
         bodies: &[ManifestBody],

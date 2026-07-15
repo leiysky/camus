@@ -141,7 +141,12 @@ durability barrier but never merges the recovery atomicity of its units.
 
 Automatic maintenance is outside the foreground FIFO and normally lower
 priority. It is promoted when sealing, checkpointing, or reclamation is needed
-for blocked capacity to make progress.
+for blocked capacity to make progress. One automatic reclamation storage job
+selects at most four segments. A completed batch yields back to the reactor
+before another low-priority batch can start, so newly queued foreground work is
+not held behind an unbounded segment scan. Continued reclamation is
+level-triggered from current storage state rather than an edge notification, so
+an idle reactor drains every remaining batch without losing maintenance work.
 
 ## Append epochs and durability
 
@@ -402,22 +407,26 @@ A bounded root preserves this invariant for every append admission:
 ```text
 projected_file_bytes
   + checkpoint_rewrite_reserve
-  + largest_manifest_frame_reserve
+  + largest_manifest_group_reserve
   + active_segment_footer_reserve
   <= configured_total_capacity
 ```
 
 - `checkpoint_rewrite_reserve` is the complete next-checkpoint upper bound for
   the current topology using worst-case bitmap release state;
-- `largest_manifest_frame_reserve` is the largest valid next release, seal, or
-  removal frame derived from configuration and current segment contents; and
+- `largest_manifest_group_reserve` is the largest valid next bounded release
+  group, seal frame, or four-frame removal batch derived from configuration
+  and current segment contents; and
 - `active_segment_footer_reserve` is 48 bytes while an active segment exists.
 
 This maintenance headroom is inside `total_bytes`, changes with topology, and
 cannot be reduced by configuration. Under pressure, a manifest commit group
-may shrink to one frame. Before the next frame would consume required
-headroom, the reactor uses the checkpoint reserve to compact and then continues
-the mutation.
+may shrink to one frame. Durable release and removal frames may remain as a
+recoverable manifest suffix; they do not require an immediate checkpoint
+rewrite. The reactor compacts when the manifest log reaches 8 MiB or a
+completed mutation consumes reserved maintenance headroom. Removing the last
+physical segment also checkpoints durable stream high-waters so a later
+missing control peer cannot be mistaken for partial empty-root initialization.
 
 `Block` keeps an append outside the command queue until capacity is admissible.
 Release and reclamation remain able to free space. `RejectNew` returns a typed
@@ -447,6 +456,13 @@ derive every stream high-water whose last physical evidence is in the segment
   -> delete the canonical segment file
   -> sync the segment directory
 ```
+
+One reclamation batch may publish several `SegmentRemoved` frames with one
+manifest `sync_data`, delete those published segment files, and issue one
+directory sync for the batch. This preserves the ordering above for every
+segment while sharing durability barriers. Automatic batches are bounded to
+four segments; an explicitly requested pass processes the complete eligible
+set as consecutive batches within one API call.
 
 The removal frame is authoritative before physical deletion. Recovery may
 therefore finish deleting a leftover file after a crash, while absence of a

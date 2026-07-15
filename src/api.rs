@@ -3,8 +3,8 @@ use crate::error::{DurabilityOutcome, Error, Result};
 use crate::model::{
     CommitStats, DurationStats, FailureInfo, MaintenanceStats, OperationCounters, OperationKind,
     OperationStats, PendingSnapshot, PressureStats, ReadLimits, ReclaimReport, Record, RecordId,
-    RecoveryStats, RootHealth, RootId, RootState, RootStats, StorageStats, StreamId, StreamStats,
-    WaitStats,
+    RecoveryStats, RootHealth, RootId, RootState, RootStats, StorageJobStats, StorageStats,
+    StreamId, StreamStats, WaitStats,
 };
 use crate::runtime::{default_runtime, run_blocking, run_blocking_guarded, Runtime, RuntimeFuture};
 use crate::storage::{
@@ -87,8 +87,10 @@ struct Shared {
     queue_wait: WaitCounters,
     readiness_wait: WaitCounters,
     capacity_wait: WaitCounters,
+    reactor_dispatch_wait: AtomicDurationStats,
     operations: AtomicOperationStats,
     storage_job_elapsed: AtomicDurationStats,
+    storage_jobs: AtomicStorageJobStats,
     detailed_observability: bool,
 }
 
@@ -123,6 +125,24 @@ struct AtomicOperationStats {
     read: AtomicOperationCounters,
     release: AtomicOperationCounters,
     reclaim: AtomicOperationCounters,
+}
+
+#[derive(Default)]
+struct AtomicStorageJobStats {
+    append: AtomicDurationStats,
+    read: AtomicDurationStats,
+    release: AtomicDurationStats,
+    reclaim: AtomicDurationStats,
+    segment_rollover: AtomicDurationStats,
+}
+
+#[derive(Clone, Copy)]
+enum StorageJobKind {
+    Append,
+    Read,
+    Release,
+    Reclaim,
+    SegmentRollover,
 }
 
 #[derive(Clone, Copy)]
@@ -163,23 +183,27 @@ enum AppendJob {
 
 enum Command {
     Append {
+        queued_at: Option<Instant>,
         stream_id: StreamId,
         records: Vec<Record>,
         encoded_bytes: u64,
         reply: oneshot::Sender<AppendReply>,
     },
     Read {
+        queued_at: Option<Instant>,
         stream_id: StreamId,
         limits: ReadLimits,
         reply: oneshot::Sender<Result<Option<PendingSnapshot>>>,
     },
     Release {
+        queued_at: Option<Instant>,
         stream_id: StreamId,
         ids: Vec<RecordId>,
         encoded_bound: u64,
         reply: oneshot::Sender<Result<()>>,
     },
     Reclaim {
+        queued_at: Option<Instant>,
         reply: oneshot::Sender<Result<ReclaimReport>>,
     },
 }
@@ -196,6 +220,7 @@ struct ReactorTermination {
 
 struct StorageJobActivity {
     shared: Weak<Shared>,
+    kind: StorageJobKind,
     armed: bool,
     started: Option<Instant>,
 }
@@ -261,8 +286,10 @@ impl Log {
             queue_wait: WaitCounters::default(),
             readiness_wait: WaitCounters::default(),
             capacity_wait: WaitCounters::default(),
+            reactor_dispatch_wait: AtomicDurationStats::default(),
             operations: AtomicOperationStats::default(),
             storage_job_elapsed: AtomicDurationStats::default(),
+            storage_jobs: AtomicStorageJobStats::default(),
             detailed_observability,
         });
         let weak = Arc::downgrade(&shared);
@@ -337,7 +364,10 @@ impl Log {
         let result = async {
             let (reply, response) = oneshot::channel();
             let permit = self.shared.reserve_running().await?;
-            permit.send(Command::Reclaim { reply });
+            permit.send(Command::Reclaim {
+                queued_at: self.shared.dispatch_timestamp(),
+                reply,
+            });
             receive_response(&self.shared, response).await
         }
         .await;
@@ -453,6 +483,7 @@ impl Stream {
                 let (reply, response) = oneshot::channel();
                 let permit = self.shared.reserve_running().await?;
                 permit.send(Command::Append {
+                    queued_at: self.shared.dispatch_timestamp(),
                     stream_id: self.id,
                     records,
                     encoded_bytes,
@@ -505,6 +536,7 @@ impl Stream {
                 let (reply, response) = oneshot::channel();
                 let permit = self.shared.reserve_running().await?;
                 permit.send(Command::Read {
+                    queued_at: self.shared.dispatch_timestamp(),
                     stream_id: self.id,
                     limits,
                     reply,
@@ -568,6 +600,7 @@ impl Stream {
             let (reply, response) = oneshot::channel();
             let permit = self.shared.reserve_running().await?;
             permit.send(Command::Release {
+                queued_at: self.shared.dispatch_timestamp(),
                 stream_id: self.id,
                 ids,
                 encoded_bound,
@@ -638,6 +671,16 @@ impl fmt::Debug for Stream {
 }
 
 impl Shared {
+    fn dispatch_timestamp(&self) -> Option<Instant> {
+        self.detailed_observability.then(Instant::now)
+    }
+
+    fn observe_dispatch_wait(&self, queued_at: Option<Instant>) {
+        if let Some(queued_at) = queued_at {
+            self.reactor_dispatch_wait.observe(queued_at.elapsed());
+        }
+    }
+
     async fn reserve_running(&self) -> Result<mpsc::Permit<'_, Command>> {
         self.ensure_running()?;
         let permit = match self.sender.try_reserve() {
@@ -718,7 +761,9 @@ impl Shared {
                 queue_depth: self.queue_depth.load(Ordering::Acquire),
                 active_storage_jobs: self.active_storage_jobs.load(Ordering::Acquire),
                 admitted_commands: self.admitted_commands.load(Ordering::Acquire),
+                reactor_dispatch_wait: self.reactor_dispatch_wait.snapshot(),
                 storage_job_elapsed: self.storage_job_elapsed.snapshot(),
+                storage_jobs: self.storage_jobs.snapshot(),
                 queue_wait: self.queue_wait.snapshot(),
                 readiness_wait: self.readiness_wait.snapshot(),
                 capacity_wait: self.capacity_wait.snapshot(),
@@ -804,6 +849,17 @@ impl Shared {
     }
 }
 
+impl Command {
+    fn queued_at(&self) -> Option<Instant> {
+        match self {
+            Self::Append { queued_at, .. }
+            | Self::Read { queued_at, .. }
+            | Self::Release { queued_at, .. }
+            | Self::Reclaim { queued_at, .. } => *queued_at,
+        }
+    }
+}
+
 impl AtomicDurationStats {
     fn observe(&self, duration: Duration) {
         let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
@@ -852,6 +908,29 @@ impl AtomicOperationStats {
             read: self.read.snapshot(),
             release: self.release.snapshot(),
             reclaim: self.reclaim.snapshot(),
+        }
+    }
+}
+
+impl AtomicStorageJobStats {
+    fn observe(&self, kind: StorageJobKind, duration: Duration) {
+        match kind {
+            StorageJobKind::Append => &self.append,
+            StorageJobKind::Read => &self.read,
+            StorageJobKind::Release => &self.release,
+            StorageJobKind::Reclaim => &self.reclaim,
+            StorageJobKind::SegmentRollover => &self.segment_rollover,
+        }
+        .observe(duration);
+    }
+
+    fn snapshot(&self) -> StorageJobStats {
+        StorageJobStats {
+            append: self.append.snapshot(),
+            read: self.read.snapshot(),
+            release: self.release.snapshot(),
+            reclaim: self.reclaim.snapshot(),
+            segment_rollover: self.segment_rollover.snapshot(),
         }
     }
 }
@@ -974,7 +1053,7 @@ impl ReactorTermination {
 }
 
 impl StorageJobActivity {
-    fn new(shared: &Weak<Shared>) -> Self {
+    fn new(shared: &Weak<Shared>, kind: StorageJobKind) -> Self {
         let (armed, started) = if let Some(shared) = shared.upgrade() {
             shared.active_storage_jobs.fetch_add(1, Ordering::AcqRel);
             (true, shared.detailed_observability.then(Instant::now))
@@ -983,6 +1062,7 @@ impl StorageJobActivity {
         };
         Self {
             shared: shared.clone(),
+            kind,
             armed,
             started,
         }
@@ -998,7 +1078,9 @@ impl Drop for StorageJobActivity {
             return;
         };
         if let Some(started) = self.started {
-            shared.storage_job_elapsed.observe(started.elapsed());
+            let elapsed = started.elapsed();
+            shared.storage_job_elapsed.observe(elapsed);
+            shared.storage_jobs.observe(self.kind, elapsed);
         }
         let previous = shared.active_storage_jobs.fetch_sub(1, Ordering::AcqRel);
         debug_assert_ne!(previous, 0);
@@ -1024,20 +1106,24 @@ async fn reactor_loop(
 ) {
     let mut storage = Some(storage);
     let mut backlog = VecDeque::new();
-    let mut maintenance_requested = false;
     let mut closing = false;
     let mut age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
 
     loop {
-        if maintenance_requested
-            && lifecycle(&shared) == RUNNING
+        if lifecycle(&shared) == RUNNING
             && backlog.is_empty()
             && receiver.is_empty()
+            && storage
+                .as_ref()
+                .is_some_and(Storage::has_automatic_reclaim_work)
         {
-            maintenance_requested = false;
-            let result = storage_job(runtime.clone(), &mut storage, &shared, |storage| {
-                storage.reclaim(ReclaimKind::Automatic)
-            })
+            let result = storage_job(
+                runtime.clone(),
+                &mut storage,
+                &shared,
+                StorageJobKind::Reclaim,
+                |storage| storage.reclaim(ReclaimKind::Automatic),
+            )
             .await;
             match result {
                 Ok(_) => publish_storage(&shared, storage.as_ref(), &[]),
@@ -1049,6 +1135,7 @@ async fn reactor_loop(
                 }
             }
             age_timer = observed_age_timer(&runtime, storage.as_ref(), &shared);
+            continue;
         }
 
         let command = if let Some(command) = backlog.pop_front() {
@@ -1062,12 +1149,18 @@ async fn reactor_loop(
                     _ = shutdown.changed() => {
                         closing = true;
                         receiver.close();
-                        maintenance_requested = false;
                         age_timer = None;
                         continue;
                     }
                     () = timer.as_mut() => {
-                        let result = storage_job(runtime.clone(), &mut storage, &shared, |storage| storage.seal_expired()).await;
+                        let result = storage_job(
+                            runtime.clone(),
+                            &mut storage,
+                            &shared,
+                            StorageJobKind::SegmentRollover,
+                            |storage| storage.seal_expired(),
+                        )
+                        .await;
                         match result {
                             Ok(_) => publish_storage(&shared, storage.as_ref(), &[]),
                             Err(error) if error.poisons_root() => {
@@ -1086,7 +1179,6 @@ async fn reactor_loop(
                     _ = shutdown.changed() => {
                         closing = true;
                         receiver.close();
-                        maintenance_requested = false;
                         continue;
                     }
                 }
@@ -1097,7 +1189,6 @@ async fn reactor_loop(
                 _ = shutdown.changed() => {
                     closing = true;
                     receiver.close();
-                    maintenance_requested = false;
                     age_timer = None;
                     continue;
                 }
@@ -1106,6 +1197,9 @@ async fn reactor_loop(
         let Some(command) = command else {
             break;
         };
+        if let Some(shared) = shared.upgrade() {
+            shared.observe_dispatch_wait(command.queued_at());
+        }
 
         if lifecycle(&shared) == POISONED {
             reject_poisoned(command);
@@ -1115,6 +1209,7 @@ async fn reactor_loop(
 
         match command {
             Command::Append {
+                queued_at: _,
                 stream_id,
                 records,
                 encoded_bytes,
@@ -1142,6 +1237,7 @@ async fn reactor_loop(
                     };
                     match next {
                         Command::Append {
+                            queued_at,
                             stream_id,
                             records,
                             encoded_bytes,
@@ -1162,6 +1258,9 @@ async fn reactor_loop(
                                 .checked_add(encoded_bytes)
                                 .is_some_and(|bytes| bytes <= max_bytes);
                             if sequence_fits && bytes_fit {
+                                if let Some(shared) = shared.upgrade() {
+                                    shared.observe_dispatch_wait(queued_at);
+                                }
                                 group_bytes += encoded_bytes;
                                 group_records.insert(
                                     stream_id,
@@ -1170,6 +1269,7 @@ async fn reactor_loop(
                                 entries.push((stream_id, records, encoded_bytes, reply));
                             } else {
                                 backlog.push_front(Command::Append {
+                                    queued_at,
                                     stream_id,
                                     records,
                                     encoded_bytes,
@@ -1199,9 +1299,13 @@ async fn reactor_loop(
                     .collect::<Vec<_>>();
                 let count = entries.len();
                 let bounded = !matches!(capacity, Capacity::Unbounded);
-                let result = storage_job(runtime.clone(), &mut storage, &shared, move |storage| {
-                    Ok(execute_append_job(storage, units, bounded))
-                })
+                let result = storage_job(
+                    runtime.clone(),
+                    &mut storage,
+                    &shared,
+                    StorageJobKind::Append,
+                    move |storage| Ok(execute_append_job(storage, units, bounded)),
+                )
                 .await;
                 match &result {
                     Ok(AppendJob::Failure { error, selected })
@@ -1221,7 +1325,7 @@ async fn reactor_loop(
                         if selected != 0 && selected <= count && outputs.len() == selected =>
                     {
                         let deferred = entries.split_off(selected);
-                        requeue_appends(&mut backlog, deferred);
+                        requeue_appends(&mut backlog, deferred, &shared);
                         for ((_, _, _, reply), ids) in entries.into_iter().zip(outputs) {
                             let _ = reply.send(AppendReply::Complete(Ok(ids)));
                         }
@@ -1246,7 +1350,7 @@ async fn reactor_loop(
                         available_bytes,
                     })) => {
                         let deferred = entries.split_off(1);
-                        requeue_appends(&mut backlog, deferred);
+                        requeue_appends(&mut backlog, deferred, &shared);
                         let (_, records, _, reply) = entries.remove(0);
                         match capacity {
                             Capacity::Bounded {
@@ -1275,7 +1379,7 @@ async fn reactor_loop(
                         total_bytes,
                     })) => {
                         let deferred = entries.split_off(1);
-                        requeue_appends(&mut backlog, deferred);
+                        requeue_appends(&mut backlog, deferred, &shared);
                         let (_, _, _, reply) = entries.remove(0);
                         let _ = reply.send(AppendReply::Complete(Err(Error::ExceedsCapacity {
                             needed_bytes,
@@ -1288,7 +1392,7 @@ async fn reactor_loop(
                         if selected != 0 && selected <= count =>
                     {
                         let deferred = entries.split_off(selected);
-                        requeue_appends(&mut backlog, deferred);
+                        requeue_appends(&mut backlog, deferred, &shared);
                         reply_append_error(entries, error);
                         selected
                     }
@@ -1308,13 +1412,18 @@ async fn reactor_loop(
                 mark_completed(&shared, completed);
             }
             Command::Read {
+                queued_at: _,
                 stream_id,
                 limits,
                 reply,
             } => {
-                let result = storage_job(runtime.clone(), &mut storage, &shared, move |storage| {
-                    storage.read(stream_id, limits)
-                })
+                let result = storage_job(
+                    runtime.clone(),
+                    &mut storage,
+                    &shared,
+                    StorageJobKind::Read,
+                    move |storage| storage.read(stream_id, limits),
+                )
                 .await;
                 let poisons = result.as_ref().err().is_some_and(Error::poisons_root);
                 if poisons {
@@ -1328,6 +1437,7 @@ async fn reactor_loop(
                 mark_completed(&shared, 1);
             }
             Command::Release {
+                queued_at: _,
                 stream_id,
                 ids,
                 encoded_bound,
@@ -1348,6 +1458,7 @@ async fn reactor_loop(
                     };
                     match next {
                         Command::Release {
+                            queued_at,
                             stream_id,
                             ids,
                             encoded_bound,
@@ -1356,6 +1467,9 @@ async fn reactor_loop(
                             .checked_add(encoded_bound)
                             .is_some_and(|bytes| bytes <= max_bytes) =>
                         {
+                            if let Some(shared) = shared.upgrade() {
+                                shared.observe_dispatch_wait(queued_at);
+                            }
                             group_bytes += encoded_bound;
                             entries.push((stream_id, ids, encoded_bound, reply));
                         }
@@ -1379,9 +1493,13 @@ async fn reactor_loop(
                         ids: ids.clone(),
                     })
                     .collect();
-                let result = storage_job(runtime.clone(), &mut storage, &shared, move |storage| {
-                    storage.release_group(units)
-                })
+                let result = storage_job(
+                    runtime.clone(),
+                    &mut storage,
+                    &shared,
+                    StorageJobKind::Release,
+                    move |storage| storage.release_group(units),
+                )
                 .await;
                 let poisons = result.as_ref().err().is_some_and(Error::poisons_root);
                 if poisons {
@@ -1397,7 +1515,6 @@ async fn reactor_loop(
                         for (_, _, _, reply) in entries {
                             let _ = reply.send(Ok(()));
                         }
-                        maintenance_requested = true;
                     }
                     Err(error) => {
                         let copies = (1..count)
@@ -1414,10 +1531,17 @@ async fn reactor_loop(
                 }
                 mark_completed(&shared, count);
             }
-            Command::Reclaim { reply } => {
-                let result = storage_job(runtime.clone(), &mut storage, &shared, |storage| {
-                    storage.reclaim(ReclaimKind::Explicit)
-                })
+            Command::Reclaim {
+                queued_at: _,
+                reply,
+            } => {
+                let result = storage_job(
+                    runtime.clone(),
+                    &mut storage,
+                    &shared,
+                    StorageJobKind::Reclaim,
+                    |storage| storage.reclaim(ReclaimKind::Explicit),
+                )
                 .await;
                 let poisons = result.as_ref().err().is_some_and(Error::poisons_root);
                 if poisons {
@@ -1462,7 +1586,8 @@ fn execute_append_job(
     let selection = (|| -> Result<(Option<usize>, CapacityCheck)> {
         let mut physical_limit = physical_limit;
         let mut selected = largest_admissible_append_prefix(storage, &units[..physical_limit])?;
-        if matches!(selected.1, CapacityCheck::Wait { .. }) {
+        if matches!(selected.1, CapacityCheck::Wait { .. }) && storage.has_automatic_reclaim_work()
+        {
             storage.reclaim(ReclaimKind::Automatic)?;
             physical_limit = storage.append_prefix_for_active_segment(&units)?;
             selected = largest_admissible_append_prefix(storage, &units[..physical_limit])?;
@@ -1502,9 +1627,16 @@ fn largest_admissible_append_prefix(
     unreachable!("the first append unit was already admissible")
 }
 
-fn requeue_appends(backlog: &mut VecDeque<Command>, entries: Vec<AppendEntry>) {
+fn requeue_appends(
+    backlog: &mut VecDeque<Command>,
+    entries: Vec<AppendEntry>,
+    shared: &Weak<Shared>,
+) {
     for (stream_id, records, encoded_bytes, reply) in entries.into_iter().rev() {
         backlog.push_front(Command::Append {
+            queued_at: shared
+                .upgrade()
+                .and_then(|shared| shared.dispatch_timestamp()),
             stream_id,
             records,
             encoded_bytes,
@@ -1530,6 +1662,7 @@ async fn storage_job<T, F>(
     runtime: Arc<dyn Runtime>,
     storage: &mut Option<Storage>,
     shared: &Weak<Shared>,
+    kind: StorageJobKind,
     job: F,
 ) -> Result<T>
 where
@@ -1537,7 +1670,7 @@ where
     F: FnOnce(&mut Storage) -> Result<T> + Send + 'static,
 {
     let current = storage.take().ok_or(Error::Poisoned)?;
-    let activity = StorageJobActivity::new(shared);
+    let activity = StorageJobActivity::new(shared, kind);
     match run_blocking_guarded(
         runtime,
         move || {
@@ -1659,7 +1792,7 @@ fn reject_poisoned(command: Command) {
         Command::Release { reply, .. } => {
             let _ = reply.send(Err(Error::Poisoned));
         }
-        Command::Reclaim { reply } => {
+        Command::Reclaim { reply, .. } => {
             let _ = reply.send(Err(Error::Poisoned));
         }
     }
@@ -1869,7 +2002,8 @@ mod tests {
             .await
             .unwrap();
         let mut health_watch = log.watch_health();
-        let activity = StorageJobActivity::new(&Arc::downgrade(&log.shared));
+        let activity =
+            StorageJobActivity::new(&Arc::downgrade(&log.shared), StorageJobKind::Reclaim);
 
         runtime.terminate_reactor();
 
@@ -1962,6 +2096,55 @@ mod tests {
             .release(vec![second_id])
             .await
             .unwrap();
+        log.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_reclaim_drains_all_bounded_batches_without_an_edge_signal() {
+        let directory = TempDir::new().unwrap();
+        let log = Log::open(
+            Config::new(directory.path(), Capacity::Unbounded)
+                .with_max_epoch_bytes(128 * 1024)
+                .with_segment_bytes(160 * 1024)
+                .with_max_release_records(1024)
+                .with_max_commit_bytes(256 * 1024)
+                .with_detailed_observability(),
+        )
+        .await
+        .unwrap();
+        let stream = log.stream(StreamId::new(28));
+        let mut ids = Vec::new();
+        for value in 0_u8..10 {
+            ids.push(
+                stream
+                    .append(Record::new(Bytes::from(vec![value; 120 * 1024])))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut events = log.shared.events.subscribe();
+        stream.release(ids).await.unwrap();
+
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = log.stats();
+                if stats.storage.live_segments == 0 {
+                    assert_eq!(stats.storage.reclaimable_segments, 0);
+                    assert_eq!(stats.maintenance.reclaimed_segments, 10);
+                    assert_eq!(stats.maintenance.automatic_reclaim_passes, 3);
+                    assert_eq!(stats.pressure.storage_jobs.reclaim.observations, 3);
+                    break;
+                }
+                events.changed().await.unwrap();
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "automatic reclaim did not drain every bounded batch: {:?}",
+            log.stats()
+        );
+
         log.shutdown().await.unwrap();
     }
 

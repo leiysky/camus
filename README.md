@@ -131,8 +131,10 @@ changing format-v1 semantics.
 An absent `max_segment_age` disables age rollover. `known_streams` and stats
 are concurrent in-memory snapshots; they do not imply a disk refresh. Root
 stats separate storage, pressure, logical-operation, durability-group,
-maintenance, and recovery state. Health is a separate low-frequency lifecycle
-view.
+maintenance, and recovery state. Detailed pressure stats separate command
+queue admission from reactor dispatch time and split finite filesystem jobs by
+append, read, release, reclaim, and timer-driven rollover. Health is a separate
+low-frequency lifecycle view.
 
 ## Example lifecycle
 

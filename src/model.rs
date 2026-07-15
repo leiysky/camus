@@ -311,6 +311,22 @@ pub struct WaitStats {
     pub elapsed: DurationStats,
 }
 
+/// Detailed elapsed time for finite filesystem jobs by reactor work kind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct StorageJobStats {
+    /// Append commit jobs, including size rollover performed by an append.
+    pub append: DurationStats,
+    /// Physical record-read jobs.
+    pub read: DurationStats,
+    /// Durable release commit jobs.
+    pub release: DurationStats,
+    /// Automatic and explicitly requested physical reclamation jobs.
+    pub reclaim: DurationStats,
+    /// Timer-driven segment rollover jobs.
+    pub segment_rollover: DurationStats,
+}
+
 /// Reactor admission and backpressure state for one open root.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -323,8 +339,12 @@ pub struct PressureStats {
     pub active_storage_jobs: usize,
     /// Number of commands admitted since this root was opened.
     pub admitted_commands: u64,
+    /// Time from queue insertion or internal requeue until reactor selection.
+    pub reactor_dispatch_wait: DurationStats,
     /// Scheduling plus filesystem duration of completed storage jobs when enabled.
     pub storage_job_elapsed: DurationStats,
+    /// Completed storage-job durations split by reactor work kind.
+    pub storage_jobs: StorageJobStats,
     /// Time spent waiting for a command-queue permit.
     pub queue_wait: WaitStats,
     /// Time waiting for a stream to become readable.

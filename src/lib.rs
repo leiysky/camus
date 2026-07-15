@@ -31,7 +31,7 @@ pub use error::{DurabilityOutcome, Error, ErrorKind, Result};
 pub use model::{
     CommitStats, DurationStats, FailureInfo, MaintenanceStats, OperationCounters, OperationKind,
     OperationStats, PendingRecord, PendingSnapshot, PressureStats, ReadLimits, ReclaimReport,
-    Record, RecordId, RecoveryStats, RootHealth, RootState, RootStats, StorageStats, StreamId,
-    StreamStats, WaitStats,
+    Record, RecordId, RecoveryStats, RootHealth, RootState, RootStats, StorageJobStats,
+    StorageStats, StreamId, StreamStats, WaitStats,
 };
 pub use runtime::{Runtime, RuntimeError, RuntimeFuture};
