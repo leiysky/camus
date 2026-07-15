@@ -1621,19 +1621,38 @@ fn largest_admissible_append_prefix(
     storage: &Storage,
     units: &[AppendUnit],
 ) -> Result<(Option<usize>, CapacityCheck)> {
-    let first = storage.check_append_capacity(&units[..1])?;
+    select_largest_admissible_prefix(units.len(), |selected| {
+        storage.check_append_capacity(&units[..selected])
+    })
+}
+
+fn select_largest_admissible_prefix(
+    unit_count: usize,
+    mut check: impl FnMut(usize) -> Result<CapacityCheck>,
+) -> Result<(Option<usize>, CapacityCheck)> {
+    debug_assert!(unit_count != 0);
+    let first = check(1)?;
     if !matches!(first, CapacityCheck::Admit) {
         return Ok((None, first));
     }
-    for selected in (1..=units.len()).rev() {
-        if matches!(
-            storage.check_append_capacity(&units[..selected])?,
-            CapacityCheck::Admit
-        ) {
-            return Ok((Some(selected), CapacityCheck::Admit));
+    if unit_count == 1 || matches!(check(unit_count)?, CapacityCheck::Admit) {
+        return Ok((Some(unit_count), CapacityCheck::Admit));
+    }
+
+    // The caller has already limited these units to one physical target. Every
+    // additional unit can only increase its encoded bytes and reserved
+    // maintenance state, so admission is monotonic across this prefix.
+    let mut admitted = 1;
+    let mut rejected = unit_count;
+    while rejected - admitted > 1 {
+        let selected = admitted + (rejected - admitted) / 2;
+        if matches!(check(selected)?, CapacityCheck::Admit) {
+            admitted = selected;
+        } else {
+            rejected = selected;
         }
     }
-    unreachable!("the first append unit was already admissible")
+    Ok((Some(admitted), CapacityCheck::Admit))
 }
 
 fn requeue_appends(
@@ -2318,5 +2337,39 @@ mod tests {
             AppendJob::Complete { selected: 1, .. }
         ));
         assert_eq!(storage.stream_stats(StreamId::new(30)).pending_records, 1);
+    }
+
+    #[test]
+    fn bounded_prefix_selection_uses_logarithmic_capacity_checks() {
+        for expected in 1..=64 {
+            let mut checks = 0;
+            let selected = select_largest_admissible_prefix(64, |prefix| {
+                checks += 1;
+                Ok(if prefix <= expected {
+                    CapacityCheck::Admit
+                } else {
+                    CapacityCheck::Wait {
+                        needed_bytes: 1,
+                        available_bytes: 0,
+                    }
+                })
+            })
+            .unwrap();
+            assert_eq!(selected, (Some(expected), CapacityCheck::Admit));
+            assert!(checks <= 8, "used {checks} checks for prefix {expected}");
+        }
+
+        let wait = CapacityCheck::Wait {
+            needed_bytes: 2,
+            available_bytes: 1,
+        };
+        let mut checks = 0;
+        let selected = select_largest_admissible_prefix(64, |_| {
+            checks += 1;
+            Ok(wait)
+        })
+        .unwrap();
+        assert_eq!(selected, (None, wait));
+        assert_eq!(checks, 1);
     }
 }
