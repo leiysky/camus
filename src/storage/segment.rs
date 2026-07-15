@@ -9,7 +9,7 @@ use crate::model::{PendingRecord, Record, RecordId, RootId, StreamId};
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -60,6 +60,10 @@ struct WrittenEpoch {
     commit: [u8; EPOCH_COMMIT_LEN as usize],
     end_offset: u64,
 }
+
+// Bound shared read backing buffers so retaining one returned body cannot pin
+// an arbitrarily large batch. A single larger record still forms one span.
+const MAX_COALESCED_READ_BYTES: u64 = 1024 * 1024;
 
 enum ScanEpoch {
     Complete {
@@ -659,75 +663,110 @@ impl Segment {
         Ok(footer)
     }
 
-    pub(super) fn read_record(
+    pub(super) fn read_records(
         &self,
         root_id: RootId,
-        record: &StoredRecord,
-    ) -> Result<PendingRecord> {
-        let mut descriptor_bytes = [0_u8; RECORD_DESCRIPTOR_LEN as usize];
-        read_exact_at(
-            &self.file,
-            &self.path,
-            &mut descriptor_bytes,
-            record.descriptor_offset,
-        )?;
-        let descriptor = RecordDescriptor::decode(&descriptor_bytes).map_err(|error| {
-            Error::corruption(&self.path, record.descriptor_offset, error.to_string())
-        })?;
-        if descriptor.metadata_len != record.metadata_len
-            || descriptor.payload_len != record.payload_len
-            || descriptor.metadata_checksum != record.metadata_checksum
-            || descriptor.payload_checksum != record.payload_checksum
-        {
-            return Err(Error::corruption(
-                &self.path,
-                record.descriptor_offset,
-                "record descriptor changed after recovery",
-            ));
-        }
+        records: &[StoredRecord],
+    ) -> Result<Vec<PendingRecord>> {
+        let mut output = Vec::with_capacity(records.len());
+        let mut first = 0;
+        while first < records.len() {
+            let (end, span_end) =
+                contiguous_record_span(&self.path, records, first, MAX_COALESCED_READ_BYTES)?;
+            let span_start = records[first].descriptor_offset;
+            let span_len = span_end.checked_sub(span_start).ok_or_else(|| {
+                Error::corruption(&self.path, span_start, "record span underflow")
+            })?;
+            let span_len = usize::try_from(span_len).map_err(|_| {
+                Error::corruption(&self.path, span_start, "record span does not fit usize")
+            })?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(span_len)
+                .map_err(|error| Error::Runtime {
+                    message: format!(
+                        "cannot reserve {span_len} coalesced record bytes from {}: {error}",
+                        self.path.display()
+                    ),
+                })?;
+            bytes.resize(span_len, 0);
+            read_exact_at(&self.file, &self.path, &mut bytes, span_start)?;
+            let bytes = Bytes::from(bytes);
 
-        let metadata_len = usize::try_from(record.metadata_len).map_err(|_| {
-            Error::corruption(
-                &self.path,
-                record.metadata_offset,
-                "metadata length does not fit usize",
-            )
-        })?;
-        let payload_len = usize::try_from(record.payload_len).map_err(|_| {
-            Error::corruption(
-                &self.path,
-                record.payload_offset,
-                "payload length does not fit usize",
-            )
-        })?;
-        let mut metadata = zeroed_body(metadata_len, "metadata")?;
-        let mut payload = zeroed_body(payload_len, "payload")?;
-        read_exact_at(
-            &self.file,
-            &self.path,
-            &mut metadata,
-            record.metadata_offset,
-        )?;
-        read_exact_at(&self.file, &self.path, &mut payload, record.payload_offset)?;
-        if checksum(&metadata) != record.metadata_checksum {
-            return Err(Error::corruption(
-                &self.path,
-                record.metadata_offset,
-                "record metadata checksum mismatch",
-            ));
+            for record in &records[first..end] {
+                let descriptor_range = span_range(
+                    &self.path,
+                    span_start,
+                    bytes.len(),
+                    record.descriptor_offset,
+                    RECORD_DESCRIPTOR_LEN,
+                    "record descriptor",
+                )?;
+                let descriptor =
+                    RecordDescriptor::decode(&bytes[descriptor_range]).map_err(|error| {
+                        Error::corruption(&self.path, record.descriptor_offset, error.to_string())
+                    })?;
+                if descriptor.metadata_len != record.metadata_len
+                    || descriptor.payload_len != record.payload_len
+                    || descriptor.metadata_checksum != record.metadata_checksum
+                    || descriptor.payload_checksum != record.payload_checksum
+                {
+                    return Err(Error::corruption(
+                        &self.path,
+                        record.descriptor_offset,
+                        "record descriptor changed after recovery",
+                    ));
+                }
+
+                let metadata_range = span_range(
+                    &self.path,
+                    span_start,
+                    bytes.len(),
+                    record.metadata_offset,
+                    record.metadata_len,
+                    "record metadata",
+                )?;
+                let payload_range = span_range(
+                    &self.path,
+                    span_start,
+                    bytes.len(),
+                    record.payload_offset,
+                    record.payload_len,
+                    "record payload",
+                )?;
+                if checksum(&bytes[metadata_range.clone()]) != record.metadata_checksum {
+                    return Err(Error::corruption(
+                        &self.path,
+                        record.metadata_offset,
+                        "record metadata checksum mismatch",
+                    ));
+                }
+                if checksum(&bytes[payload_range.clone()]) != record.payload_checksum {
+                    return Err(Error::corruption(
+                        &self.path,
+                        record.payload_offset,
+                        "record payload checksum mismatch",
+                    ));
+                }
+                let metadata = if metadata_range.is_empty() {
+                    Bytes::new()
+                } else {
+                    bytes.slice(metadata_range)
+                };
+                let payload = if payload_range.is_empty() {
+                    Bytes::new()
+                } else {
+                    bytes.slice(payload_range)
+                };
+                output.push(PendingRecord {
+                    id: RecordId::from_parts(root_id, record.stream_id, record.sequence),
+                    metadata,
+                    payload,
+                });
+            }
+            first = end;
         }
-        if checksum(&payload) != record.payload_checksum {
-            return Err(Error::corruption(
-                &self.path,
-                record.payload_offset,
-                "record payload checksum mismatch",
-            ));
-        }
-        Ok(PendingRecord {
-            id: RecordId::from_parts(root_id, record.stream_id, record.sequence),
-            metadata: Bytes::from(metadata),
-            payload: Bytes::from(payload),
-        })
+        Ok(output)
     }
 
     pub(super) fn has_checkpoint_boundary(&self, record_count: u64) -> bool {
@@ -763,15 +802,87 @@ fn tail_repair_allowed(
     })
 }
 
-fn zeroed_body(length: usize, name: &str) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|error| Error::Runtime {
-            message: format!("cannot reserve {length} record {name} bytes: {error}"),
+fn contiguous_record_span(
+    path: &Path,
+    records: &[StoredRecord],
+    first: usize,
+    max_bytes: u64,
+) -> Result<(usize, u64)> {
+    let span_start = records[first].descriptor_offset;
+    let mut end = first + 1;
+    let mut span_end = record_end(path, &records[first])?;
+    while end < records.len() && records[end].descriptor_offset == span_end {
+        let next_end = record_end(path, &records[end])?;
+        let projected = next_end.checked_sub(span_start).ok_or_else(|| {
+            Error::corruption(path, span_start, "coalesced record span underflow")
         })?;
-    bytes.resize(length, 0);
-    Ok(bytes)
+        if projected > max_bytes {
+            break;
+        }
+        span_end = next_end;
+        end += 1;
+    }
+    Ok((end, span_end))
+}
+
+fn record_end(path: &Path, record: &StoredRecord) -> Result<u64> {
+    let metadata_offset = record
+        .descriptor_offset
+        .checked_add(RECORD_DESCRIPTOR_LEN)
+        .ok_or_else(|| {
+            Error::corruption(path, record.descriptor_offset, "metadata offset overflow")
+        })?;
+    if metadata_offset != record.metadata_offset {
+        return Err(Error::corruption(
+            path,
+            record.descriptor_offset,
+            "stored metadata offset is not canonical",
+        ));
+    }
+    let payload_offset = metadata_offset
+        .checked_add(record.metadata_len)
+        .ok_or_else(|| {
+            Error::corruption(path, record.metadata_offset, "payload offset overflow")
+        })?;
+    if payload_offset != record.payload_offset {
+        return Err(Error::corruption(
+            path,
+            record.metadata_offset,
+            "stored payload offset is not canonical",
+        ));
+    }
+    payload_offset
+        .checked_add(record.payload_len)
+        .ok_or_else(|| Error::corruption(path, record.payload_offset, "record end overflow"))
+}
+
+fn span_range(
+    path: &Path,
+    span_start: u64,
+    span_len: usize,
+    offset: u64,
+    length: u64,
+    name: &str,
+) -> Result<std::ops::Range<usize>> {
+    let relative = offset
+        .checked_sub(span_start)
+        .ok_or_else(|| Error::corruption(path, offset, format!("{name} precedes read span")))?;
+    let end = relative
+        .checked_add(length)
+        .ok_or_else(|| Error::corruption(path, offset, format!("{name} range overflow")))?;
+    let start = usize::try_from(relative).map_err(|_| {
+        Error::corruption(path, offset, format!("{name} offset does not fit usize"))
+    })?;
+    let end = usize::try_from(end)
+        .map_err(|_| Error::corruption(path, offset, format!("{name} end does not fit usize")))?;
+    if end > span_len {
+        return Err(Error::corruption(
+            path,
+            offset,
+            format!("{name} exceeds read span"),
+        ));
+    }
+    Ok(start..end)
 }
 
 fn scan_epoch(file: &File, path: &Path, start: u64, file_len: u64) -> Result<ScanEpoch> {
@@ -923,30 +1034,34 @@ fn write_epoch(
             error,
         ));
     }
-    file.write_all(&epoch.header).map_err(|error| {
-        Error::io(
-            "write epoch header",
-            path,
-            DurabilityOutcome::Unknown,
-            error,
-        )
-    })?;
+    let commit = EpochCommit {
+        epoch_start: start,
+        epoch_bytes: epoch.encoded_bytes,
+        epoch_digest: epoch_digest(&epoch.header, &epoch.descriptors),
+    }
+    .encode();
+    let mut slices = Vec::with_capacity(epoch.records.len().saturating_mul(3).saturating_add(2));
+    slices.push(IoSlice::new(&epoch.header));
+    for (record, descriptor) in epoch.records.iter().zip(&epoch.descriptors) {
+        slices.push(IoSlice::new(descriptor));
+        if !record.metadata.is_empty() {
+            slices.push(IoSlice::new(&record.metadata));
+        }
+        if !record.payload.is_empty() {
+            slices.push(IoSlice::new(&record.payload));
+        }
+    }
+    slices.push(IoSlice::new(&commit));
+    write_all_vectored(file, path, &mut slices)?;
+    drop(slices);
+
     let mut offset = start
         .checked_add(EPOCH_HEADER_LEN)
         .ok_or_else(|| Error::corruption(path, start, "epoch header end overflow"))?;
     let mut stored = Vec::with_capacity(epoch.records.len());
-    for (index, (record, descriptor_bytes)) in epoch
-        .records
-        .into_iter()
-        .zip(epoch.descriptors.iter())
-        .enumerate()
-    {
+    for (index, descriptor_bytes) in epoch.descriptors.iter().enumerate() {
         let descriptor = RecordDescriptor::decode(descriptor_bytes)
             .map_err(|error| Error::corruption(path, offset, error.to_string()))?;
-        file.write_all(descriptor_bytes)
-            .and_then(|()| file.write_all(&record.metadata))
-            .and_then(|()| file.write_all(&record.payload))
-            .map_err(|error| Error::io("write record", path, DurabilityOutcome::Unknown, error))?;
         let metadata_offset = offset
             .checked_add(RECORD_DESCRIPTOR_LEN)
             .ok_or_else(|| Error::corruption(path, offset, "metadata offset overflow"))?;
@@ -974,20 +1089,6 @@ fn write_epoch(
             .checked_add(descriptor.payload_len)
             .ok_or_else(|| Error::corruption(path, offset, "record end overflow"))?;
     }
-    let commit = EpochCommit {
-        epoch_start: start,
-        epoch_bytes: epoch.encoded_bytes,
-        epoch_digest: epoch_digest(&epoch.header, &epoch.descriptors),
-    }
-    .encode();
-    file.write_all(&commit).map_err(|error| {
-        Error::io(
-            "write epoch commit",
-            path,
-            DurabilityOutcome::Unknown,
-            error,
-        )
-    })?;
     let end_offset = offset
         .checked_add(EPOCH_COMMIT_LEN)
         .ok_or_else(|| Error::corruption(path, offset, "epoch end overflow"))?;
@@ -997,6 +1098,36 @@ fn write_epoch(
         commit,
         end_offset,
     })
+}
+
+fn write_all_vectored(file: &mut File, path: &Path, slices: &mut [IoSlice<'_>]) -> Result<()> {
+    // `File::write_vectored` writes a platform-supported prefix when the slice
+    // count exceeds one syscall's iovec bound. Advancing that prefix also
+    // handles ordinary partial writes without imposing a smaller fixed limit.
+    let mut remaining = slices;
+    while !remaining.is_empty() {
+        match file.write_vectored(remaining) {
+            Ok(0) => {
+                return Err(Error::io(
+                    "write epoch",
+                    path,
+                    DurabilityOutcome::Unknown,
+                    io::Error::new(io::ErrorKind::WriteZero, "failed to write whole epoch"),
+                ));
+            }
+            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(Error::io(
+                    "write epoch",
+                    path,
+                    DurabilityOutcome::Unknown,
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn repair_tail(file: &mut File, path: &Path, length: u64) -> Result<()> {

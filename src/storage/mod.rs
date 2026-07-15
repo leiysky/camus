@@ -22,7 +22,7 @@ use files::{
     sync_directory, RootLock, CHECKPOINT_FILE, MANIFEST_LOG_FILE, ROOT_FILE, ROOT_TEMP_FILE,
 };
 use manifest::{checkpoint_from_state, ControlRecovery, Manifest};
-use segment::{validate_removed_segment_header, PreparedEpoch, Segment};
+use segment::{validate_removed_segment_header, PreparedEpoch, Segment, StoredRecord};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -819,7 +819,8 @@ impl Storage {
         let Some(stream) = self.streams.get(&stream_id) else {
             return Ok(None);
         };
-        let mut selected = Vec::new();
+        let mut selected = Vec::<StoredRecord>::new();
+        let mut segment_groups = Vec::<(u64, usize)>::new();
         let mut payload_bytes = 0_u64;
         for (sequence, pointer) in stream.pending.iter().take(limits.max_records) {
             let record = self
@@ -853,14 +854,25 @@ impl Storage {
                 break;
             }
             payload_bytes = projected;
-            selected.push((*pointer, record.clone()));
+            if segment_groups
+                .last()
+                .is_none_or(|(segment_id, _)| *segment_id != pointer.segment_id)
+            {
+                segment_groups.push((pointer.segment_id, selected.len()));
+            }
+            selected.push(record.clone());
         }
         if selected.is_empty() {
             return Ok(None);
         }
         let mut records = Vec::with_capacity(selected.len());
-        for (pointer, record) in selected {
-            records.push(self.segments[&pointer.segment_id].read_record(self.root_id, &record)?);
+        for (index, (segment_id, start)) in segment_groups.iter().copied().enumerate() {
+            let end = segment_groups
+                .get(index + 1)
+                .map_or(selected.len(), |(_, start)| *start);
+            records.extend(
+                self.segments[&segment_id].read_records(self.root_id, &selected[start..end])?,
+            );
         }
         Ok(Some(PendingSnapshot::new(records)))
     }
@@ -2124,6 +2136,164 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(ids[0].stream_id(), stream_id);
+    }
+
+    #[test]
+    fn coalesced_read_preserves_order_across_released_gaps() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(70);
+        let mut storage = Storage::open(config(&directory)).unwrap();
+        let ids = storage
+            .append_group(vec![AppendUnit {
+                stream_id,
+                records: (0_u8..4)
+                    .map(|value| Record {
+                        metadata: Bytes::from(vec![value; 8]),
+                        payload: Bytes::from(vec![value; 64]),
+                    })
+                    .collect(),
+            }])
+            .unwrap()
+            .remove(0);
+        storage
+            .release_group(vec![ReleaseUnit {
+                stream_id,
+                ids: vec![ids[1], ids[2]],
+            }])
+            .unwrap();
+
+        let snapshot = storage
+            .read(stream_id, ReadLimits::new(4, 256))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].id, ids[0]);
+        assert_eq!(snapshot[0].metadata, Bytes::from(vec![0; 8]));
+        assert_eq!(snapshot[0].payload, Bytes::from(vec![0; 64]));
+        assert_eq!(snapshot[1].id, ids[3]);
+        assert_eq!(snapshot[1].metadata, Bytes::from(vec![3; 8]));
+        assert_eq!(snapshot[1].payload, Bytes::from(vec![3; 64]));
+    }
+
+    #[test]
+    fn coalesced_read_fails_the_snapshot_on_body_corruption() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(71);
+        let mut storage = Storage::open(config(&directory)).unwrap();
+        storage
+            .append_group(vec![AppendUnit {
+                stream_id,
+                records: (0_u8..4)
+                    .map(|value| Record {
+                        metadata: Bytes::from(vec![value; 8]),
+                        payload: Bytes::from(vec![value; 64]),
+                    })
+                    .collect(),
+            }])
+            .unwrap();
+        let segment_id = storage.active_segment.unwrap();
+        let segment = &storage.segments[&segment_id];
+        let payload_offset = segment.records[2].payload_offset;
+        let path = segment.path.clone();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(payload_offset)).unwrap();
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        file.seek(SeekFrom::Start(payload_offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_data().unwrap();
+
+        assert!(matches!(
+            storage.read(stream_id, ReadLimits::new(4, 256)),
+            Err(Error::Corruption { offset, .. }) if offset == payload_offset
+        ));
+    }
+
+    #[test]
+    fn bounded_coalesced_read_preserves_records_across_span_splits() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(72);
+        let mut storage = Storage::open(
+            config(&directory)
+                .with_max_epoch_bytes(2 * 1024 * 1024)
+                .with_segment_bytes(3 * 1024 * 1024)
+                .with_max_commit_bytes(2 * 1024 * 1024),
+        )
+        .unwrap();
+        let expected = (0_u8..20)
+            .map(|value| Record {
+                metadata: Bytes::from(vec![value; 8]),
+                payload: Bytes::from(vec![value; 64 * 1024]),
+            })
+            .collect::<Vec<_>>();
+        let ids = storage
+            .append_group(vec![AppendUnit {
+                stream_id,
+                records: expected.clone(),
+            }])
+            .unwrap()
+            .remove(0);
+
+        let snapshot = storage
+            .read(stream_id, ReadLimits::new(expected.len(), 2 * 1024 * 1024))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.len(), expected.len());
+        for ((pending, expected), id) in snapshot.iter().zip(&expected).zip(ids) {
+            assert_eq!(pending.id, id);
+            assert_eq!(pending.metadata, expected.metadata);
+            assert_eq!(pending.payload, expected.payload);
+        }
+    }
+
+    #[test]
+    fn vectored_epoch_write_preserves_records_across_platform_iovec_bounds() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(73);
+        let expected = (0_u16..500)
+            .map(|index| {
+                let value = (index % 251) as u8;
+                Record {
+                    metadata: if index % 3 == 0 {
+                        Bytes::new()
+                    } else {
+                        Bytes::from(vec![value; 8])
+                    },
+                    payload: if index % 4 == 0 {
+                        Bytes::new()
+                    } else {
+                        Bytes::from(vec![value; 64])
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let ids = {
+            let mut storage = Storage::open(config(&directory)).unwrap();
+            storage
+                .append_group(vec![AppendUnit {
+                    stream_id,
+                    records: expected.clone(),
+                }])
+                .unwrap()
+                .remove(0)
+        };
+
+        let storage = Storage::open(config(&directory)).unwrap();
+        let snapshot = storage
+            .read(stream_id, ReadLimits::new(expected.len(), 64 * 500))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.len(), expected.len());
+        for ((pending, expected), id) in snapshot.iter().zip(&expected).zip(ids) {
+            assert_eq!(pending.id, id);
+            assert_eq!(pending.metadata, expected.metadata);
+            assert_eq!(pending.payload, expected.payload);
+        }
     }
 
     #[test]

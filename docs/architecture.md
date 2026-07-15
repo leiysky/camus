@@ -186,6 +186,10 @@ write every complete epoch, including every record and epoch commit
 
 Each epoch has exactly one covering data durability barrier. Several epochs
 may share that barrier. No append reports success before the barrier succeeds.
+Epoch headers, record descriptors, caller-owned metadata and payload buffers,
+and commit markers are submitted through bounded vectored writes before that
+barrier. This reduces syscall count without concatenating or copying opaque
+record bodies and does not change any byte layout or recovery boundary.
 
 Every epoch and complete append group stays in one segment. Group selection is
 therefore also bounded by remaining segment space. If another epoch would not
@@ -290,11 +294,16 @@ smaller later records. If that first record alone exceeds the byte limit, the
 operation returns its ID, required bytes, and configured bytes in a typed
 non-poisoning error.
 
-The storage job resolves internal physical locations and may coalesce adjacent
-reads without changing logical result order. Before returning, it verifies the
-metadata and payload checksum of every selected record. Any mismatch fails the
-entire operation without a partial snapshot and poisons the root as
-authoritative corruption.
+The storage job resolves internal physical locations and coalesces bounded runs
+of exactly adjacent selected record frames into one positional file read
+without changing logical result order. Released gaps, epoch boundaries,
+segment boundaries, and the internal coalescing bound end a span; one record
+larger than that bound is still read whole. Returned metadata and payload are
+zero-copy slices of the bounded span, and empty bodies do not retain its
+backing allocation. Before returning, Camus independently validates every
+descriptor plus the metadata and payload checksum of every selected record.
+Any mismatch fails the entire operation without a partial snapshot and poisons
+the root as authoritative corruption.
 
 The returned snapshot owns its records. It is observation only: it does not
 reserve, hide, or mutate them. Any number of stream handles may receive the
