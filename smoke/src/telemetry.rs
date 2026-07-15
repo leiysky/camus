@@ -325,9 +325,28 @@ fn pressure_metrics(output: &mut String, run_id: &str, timestamp: u64, stats: &R
         output,
         run_id,
         timestamp,
+        "reactor_dispatch",
+        pressure.reactor_dispatch_wait,
+    );
+    duration_metrics(
+        output,
+        run_id,
+        timestamp,
         "storage_job",
         pressure.storage_job_elapsed,
     );
+    for (kind, duration) in [
+        ("storage_append", pressure.storage_jobs.append),
+        ("storage_read", pressure.storage_jobs.read),
+        ("storage_release", pressure.storage_jobs.release),
+        ("storage_reclaim", pressure.storage_jobs.reclaim),
+        (
+            "storage_segment_rollover",
+            pressure.storage_jobs.segment_rollover,
+        ),
+    ] {
+        duration_metrics(output, run_id, timestamp, kind, duration);
+    }
 }
 
 fn wait_metrics(output: &mut String, run_id: &str, timestamp: u64, kind: &str, wait: WaitStats) {
@@ -1118,9 +1137,15 @@ pub(crate) fn write_victoria_report(
     writeln!(report, "| --- | ---: | ---: | ---: |")?;
     for (label, kind) in [
         ("Command queue wait", "queue"),
+        ("Reactor dispatch wait", "reactor_dispatch"),
         ("Readiness wait", "readiness"),
         ("Capacity wait", "capacity"),
         ("Storage job", "storage_job"),
+        ("Storage append job", "storage_append"),
+        ("Storage read job", "storage_read"),
+        ("Storage release job", "storage_release"),
+        ("Storage reclaim job", "storage_reclaim"),
+        ("Storage segment-rollover job", "storage_segment_rollover"),
     ] {
         let observations = max_value(&series, "duration_observations_total", &[("kind", kind)]);
         let total = max_value(&series, "duration_seconds_total", &[("kind", kind)]);

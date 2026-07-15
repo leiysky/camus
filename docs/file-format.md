@@ -702,11 +702,12 @@ the configured segment ceiling.
 
 The worst next-checkpoint reserve is derived from the fixed layouts above and
 bitmap release state for every current physical record. The largest next
-manifest-frame reserve is the maximum of:
+manifest-group reserve is the maximum of:
 
 - `48 + 24 + 16 * max_release_records` for a maximally fragmented Release;
 - `80` bytes for SegmentSealed; and
-- `64 + 16 * stream_count_in_largest_removable_segment` for SegmentRemoved.
+- four times `64 + 16 * stream_count_in_largest_removable_segment` for the
+  bounded SegmentRemoved maintenance batch.
 
 The active segment contributes a separate 48-byte footer reserve. These
 derived bytes are part of bounded root capacity but are not stored in the

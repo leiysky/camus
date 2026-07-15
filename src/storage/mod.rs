@@ -28,6 +28,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+const AUTOMATIC_RECLAIM_SEGMENTS_PER_JOB: usize = 4;
+const MANIFEST_COMPACTION_TRIGGER_BYTES: u64 = 8 * 1024 * 1024;
+
+fn manifest_compaction_required(
+    log_bytes: u64,
+    actual_file_bytes: u64,
+    maintenance_headroom_bytes: u64,
+    capacity: Capacity,
+) -> bool {
+    log_bytes >= MANIFEST_COMPACTION_TRIGGER_BYTES
+        || match capacity {
+            Capacity::Unbounded => false,
+            Capacity::Bounded { total_bytes, .. } => actual_file_bytes
+                .checked_add(maintenance_headroom_bytes)
+                .is_none_or(|required| required > total_bytes),
+        }
+}
+
 #[derive(Debug)]
 pub(crate) struct AppendUnit {
     pub(crate) stream_id: StreamId,
@@ -912,10 +930,8 @@ impl Storage {
                 self.mark_record_released(stream_id, sequence);
             }
         }
-        if matches!(self.config.capacity, Capacity::Bounded { .. }) {
-            self.compact_manifest()?;
-        }
         self.actual_file_bytes = self.calculate_actual_file_bytes()?;
+        self.maybe_compact_manifest()?;
         Ok(())
     }
 
@@ -990,30 +1006,89 @@ impl Storage {
                 self.seal_active(SealReason::Reclaim)?;
             }
         }
+        let limit = match kind {
+            ReclaimKind::Automatic => AUTOMATIC_RECLAIM_SEGMENTS_PER_JOB,
+            ReclaimKind::Explicit => usize::MAX,
+        };
         let eligible = self
             .segments
             .iter()
             .filter(|(_, segment)| segment.footer.is_some() && segment.unreleased_records == 0)
             .map(|(segment_id, _)| *segment_id)
+            .take(limit)
             .collect::<Vec<_>>();
         let mut report = ReclaimReport::default();
-        for segment_id in eligible {
-            let body = self.removal_body(segment_id);
-            self.manifest.append_group(
-                &[ManifestBody::SegmentRemoved(body.clone())],
-                DurabilityOutcome::Unknown,
-            )?;
-            #[cfg(test)]
-            crate::test_crash::hit("reclaim.after_manifest_sync");
+        for batch in eligible.chunks(AUTOMATIC_RECLAIM_SEGMENTS_PER_JOB) {
+            let reclaimed = self.reclaim_batch(batch)?;
+            report.segments = report.segments.saturating_add(reclaimed.segments);
+            report.bytes = report.bytes.saturating_add(reclaimed.bytes);
+        }
+        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
+        if !report.is_empty() && self.segments.is_empty() {
+            self.compact_manifest()?;
+            self.actual_file_bytes = self.calculate_actual_file_bytes()?;
+        } else {
+            self.maybe_compact_manifest()?;
+        }
+        match kind {
+            ReclaimKind::Automatic => {
+                self.maintenance.automatic_reclaim_passes =
+                    self.maintenance.automatic_reclaim_passes.saturating_add(1);
+            }
+            ReclaimKind::Explicit => {
+                self.maintenance.explicit_reclaim_passes =
+                    self.maintenance.explicit_reclaim_passes.saturating_add(1);
+            }
+        }
+        Ok(report)
+    }
+
+    fn reclaim_batch(&mut self, eligible: &[u64]) -> Result<ReclaimReport> {
+        debug_assert!(eligible.len() <= AUTOMATIC_RECLAIM_SEGMENTS_PER_JOB);
+        if eligible.is_empty() {
+            return Ok(ReclaimReport::default());
+        }
+        let mut persisted_highwaters = self
+            .streams
+            .iter()
+            .filter_map(|(stream_id, stream)| {
+                stream
+                    .persisted_highwater
+                    .map(|sequence| (*stream_id, sequence))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let removals = eligible
+            .iter()
+            .map(|segment_id| {
+                let body = self.removal_body(*segment_id, &persisted_highwaters);
+                for highwater in &body.highwaters {
+                    persisted_highwaters.insert(highwater.stream_id, highwater.sequence);
+                }
+                body
+            })
+            .collect::<Vec<_>>();
+        let frames = removals
+            .iter()
+            .cloned()
+            .map(ManifestBody::SegmentRemoved)
+            .collect::<Vec<_>>();
+        self.manifest
+            .append_group(&frames, DurabilityOutcome::Unknown)?;
+        #[cfg(test)]
+        crate::test_crash::hit("reclaim.after_manifest_sync");
+        for body in &removals {
             for highwater in &body.highwaters {
                 self.streams
                     .get_mut(&highwater.stream_id)
                     .expect("removed segment stream exists")
                     .persisted_highwater = Some(highwater.sequence);
             }
+        }
+        let mut removed = Vec::with_capacity(eligible.len());
+        for segment_id in eligible {
             let segment = self
                 .segments
-                .remove(&segment_id)
+                .remove(segment_id)
                 .expect("eligible segment exists");
             let bytes = segment.file_len;
             self.reclaimable_segments = self
@@ -1045,43 +1120,43 @@ impl Storage {
             })?;
             #[cfg(test)]
             crate::test_crash::hit("reclaim.after_delete");
-            #[cfg(test)]
-            crate::test_crash::inject_io("reclaim.directory_sync").map_err(|error| {
-                Error::io(
-                    "sync segment directory",
-                    &self.segments_directory,
-                    DurabilityOutcome::Unknown,
-                    error,
-                )
-            })?;
-            sync_directory(&self.segments_directory, DurabilityOutcome::Unknown)?;
-            #[cfg(test)]
-            crate::test_crash::hit("reclaim.after_directory_sync");
-            report.segments = report.segments.saturating_add(1);
-            report.bytes = report.bytes.saturating_add(bytes);
-            self.maintenance.reclaimed_segments =
-                self.maintenance.reclaimed_segments.saturating_add(1);
-            self.maintenance.reclaimed_bytes =
-                self.maintenance.reclaimed_bytes.saturating_add(bytes);
+            removed.push(bytes);
         }
-        if !report.is_empty() {
-            self.compact_manifest()?;
-        }
+        #[cfg(test)]
+        crate::test_crash::inject_io("reclaim.directory_sync").map_err(|error| {
+            Error::io(
+                "sync segment directory",
+                &self.segments_directory,
+                DurabilityOutcome::Unknown,
+                error,
+            )
+        })?;
+        sync_directory(&self.segments_directory, DurabilityOutcome::Unknown)?;
+        #[cfg(test)]
+        crate::test_crash::hit("reclaim.after_directory_sync");
+        let report = ReclaimReport {
+            segments: u64::try_from(removed.len()).unwrap_or(u64::MAX),
+            bytes: removed
+                .iter()
+                .fold(0_u64, |total, bytes| total.saturating_add(*bytes)),
+        };
+        self.maintenance.reclaimed_segments = self
+            .maintenance
+            .reclaimed_segments
+            .saturating_add(report.segments);
+        self.maintenance.reclaimed_bytes = self
+            .maintenance
+            .reclaimed_bytes
+            .saturating_add(report.bytes);
         self.actual_file_bytes = self.calculate_actual_file_bytes()?;
-        match kind {
-            ReclaimKind::Automatic => {
-                self.maintenance.automatic_reclaim_passes =
-                    self.maintenance.automatic_reclaim_passes.saturating_add(1);
-            }
-            ReclaimKind::Explicit => {
-                self.maintenance.explicit_reclaim_passes =
-                    self.maintenance.explicit_reclaim_passes.saturating_add(1);
-            }
-        }
         Ok(report)
     }
 
-    fn removal_body(&self, segment_id: u64) -> SegmentRemovedBody {
+    fn removal_body(
+        &self,
+        segment_id: u64,
+        persisted_highwaters: &BTreeMap<StreamId, u64>,
+    ) -> SegmentRemovedBody {
         let mut maxima = BTreeMap::new();
         for record in &self.segments[&segment_id].records {
             maxima
@@ -1092,8 +1167,9 @@ impl Storage {
         let highwaters = maxima
             .into_iter()
             .filter_map(|(stream_id, sequence)| {
-                let persisted = self.streams[&stream_id].persisted_highwater;
-                persisted
+                persisted_highwaters
+                    .get(&stream_id)
+                    .copied()
                     .is_none_or(|current| sequence > current)
                     .then_some(StreamHighwater {
                         stream_id,
@@ -1110,10 +1186,8 @@ impl Storage {
     pub(crate) fn seal_expired(&mut self) -> Result<bool> {
         if self.active_segment.is_some() && self.active_expired()? {
             self.seal_active(SealReason::Age)?;
-            if matches!(self.config.capacity, Capacity::Bounded { .. }) {
-                self.compact_manifest()?;
-            }
             self.actual_file_bytes = self.calculate_actual_file_bytes()?;
+            self.maybe_compact_manifest()?;
             return Ok(true);
         }
         Ok(false)
@@ -1219,6 +1293,28 @@ impl Storage {
             stream.persisted_highwater = stream.highwater;
         }
         Ok(())
+    }
+
+    fn maybe_compact_manifest(&mut self) -> Result<bool> {
+        let log_bytes = self.manifest.file_len()?;
+        if !manifest_compaction_required(
+            log_bytes,
+            self.actual_file_bytes,
+            self.maintenance_headroom_bytes()?,
+            self.config.capacity,
+        ) {
+            return Ok(false);
+        }
+        self.compact_manifest()?;
+        self.actual_file_bytes = self.calculate_actual_file_bytes()?;
+        Ok(true)
+    }
+
+    pub(crate) fn has_automatic_reclaim_work(&self) -> bool {
+        self.reclaimable_segments != 0
+            || self
+                .active_segment
+                .is_some_and(|segment_id| self.segments[&segment_id].unreleased_records == 0)
     }
 
     pub(crate) fn known_streams(&self) -> Vec<StreamId> {
@@ -1475,7 +1571,7 @@ impl Storage {
                     .map_err(|_| Error::invalid_config("stream count does not fit u64"))?,
             );
         }
-        let manifest = self.largest_manifest_frame(largest_segment_streams)?;
+        let manifest = self.largest_manifest_group(largest_segment_streams)?;
         checkpoint
             .checked_add(manifest)
             .and_then(|bytes| bytes.checked_add(SEGMENT_FOOTER_LEN))
@@ -1517,7 +1613,7 @@ impl Storage {
             .map_err(|_| Error::invalid_config("stream count does not fit u64"))?;
         actual
             .checked_add(checkpoint_reserve)
-            .and_then(|bytes| bytes.checked_add(self.largest_manifest_frame(segment_streams).ok()?))
+            .and_then(|bytes| bytes.checked_add(self.largest_manifest_group(segment_streams).ok()?))
             .and_then(|bytes| bytes.checked_add(SEGMENT_FOOTER_LEN))
             .ok_or_else(|| Error::invalid_config("minimum root capacity overflow"))
     }
@@ -1561,7 +1657,7 @@ impl Storage {
                     .map_err(|_| Error::invalid_config("segment stream count does not fit u64"))?,
             );
         }
-        let manifest = self.largest_manifest_frame(largest_segment_streams)?;
+        let manifest = self.largest_manifest_group(largest_segment_streams)?;
         checkpoint
             .checked_add(manifest)
             .and_then(|bytes| {
@@ -1574,7 +1670,7 @@ impl Storage {
             .ok_or_else(|| Error::invalid_config("maintenance headroom overflow"))
     }
 
-    fn largest_manifest_frame(&self, largest_segment_streams: u64) -> Result<u64> {
+    fn largest_manifest_group(&self, largest_segment_streams: u64) -> Result<u64> {
         let release_records = u64::try_from(self.config.max_release_records)
             .map_err(|_| Error::invalid_config("release bound does not fit u64"))?;
         let release_frame = MANIFEST_FRAME_HEADER_LEN
@@ -1588,7 +1684,12 @@ impl Storage {
                     .ok_or_else(|| Error::invalid_config("removal frame reserve overflow"))?,
             )
             .ok_or_else(|| Error::invalid_config("removal frame reserve overflow"))?;
-        Ok(release_frame.max(80).max(removal_frame))
+        let removal_frames = u64::try_from(AUTOMATIC_RECLAIM_SEGMENTS_PER_JOB)
+            .map_err(|_| Error::invalid_config("reclaim batch size does not fit u64"))?;
+        let removal_group = removal_frame
+            .checked_mul(removal_frames)
+            .ok_or_else(|| Error::invalid_config("removal group reserve overflow"))?;
+        Ok(release_frame.max(80).max(removal_group))
     }
 
     fn calculate_actual_file_bytes(&self) -> Result<u64> {
@@ -1960,6 +2061,28 @@ mod tests {
     }
 
     #[test]
+    fn manifest_compaction_policy_uses_log_and_capacity_thresholds() {
+        assert!(!manifest_compaction_required(
+            MANIFEST_COMPACTION_TRIGGER_BYTES - 1,
+            100,
+            100,
+            Capacity::Unbounded,
+        ));
+        assert!(manifest_compaction_required(
+            MANIFEST_COMPACTION_TRIGGER_BYTES,
+            100,
+            100,
+            Capacity::Unbounded,
+        ));
+        let bounded = Capacity::Bounded {
+            total_bytes: 200,
+            when_full: crate::config::FullPolicy::RejectNew,
+        };
+        assert!(!manifest_compaction_required(1, 100, 100, bounded));
+        assert!(manifest_compaction_required(1, 101, 100, bounded));
+    }
+
+    #[test]
     fn append_release_reclaim_and_recover() {
         let directory = TempDir::new().unwrap();
         let stream_id = StreamId::new(7);
@@ -2001,6 +2124,123 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(ids[0].stream_id(), stream_id);
+    }
+
+    #[test]
+    fn bounded_release_keeps_a_small_durable_manifest_suffix() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(8);
+        let bounded = Config::new(
+            directory.path(),
+            Capacity::Bounded {
+                total_bytes: 16 * 1024 * 1024,
+                when_full: crate::config::FullPolicy::RejectNew,
+            },
+        )
+        .with_max_epoch_bytes(128 * 1024)
+        .with_segment_bytes(256 * 1024)
+        .with_max_release_records(1024)
+        .with_max_commit_bytes(256 * 1024);
+        {
+            let mut storage = Storage::open(bounded.clone()).unwrap();
+            let id = storage
+                .append_group(vec![AppendUnit {
+                    stream_id,
+                    records: vec![Record::new(Bytes::from_static(b"pending"))],
+                }])
+                .unwrap()
+                .remove(0)
+                .remove(0);
+            storage
+                .release_group(vec![ReleaseUnit {
+                    stream_id,
+                    ids: vec![id],
+                }])
+                .unwrap();
+            assert_eq!(storage.maintenance_stats().manifest_compactions, 0);
+            assert!(storage.manifest.file_len().unwrap() > MANIFEST_LOG_HEADER_LEN);
+        }
+
+        let storage = Storage::open(bounded).unwrap();
+        assert_eq!(storage.stream_stats(stream_id).pending_records, 0);
+    }
+
+    #[test]
+    fn automatic_reclaim_limits_and_batches_each_storage_job() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(9);
+        let compact_segments = Config::new(directory.path(), Capacity::Unbounded)
+            .with_max_epoch_bytes(128 * 1024)
+            .with_segment_bytes(160 * 1024)
+            .with_max_release_records(1024)
+            .with_max_commit_bytes(256 * 1024);
+        {
+            let mut storage = Storage::open(compact_segments.clone()).unwrap();
+            let mut ids = Vec::new();
+            for value in 0_u8..10 {
+                ids.extend(
+                    storage
+                        .append_group(vec![AppendUnit {
+                            stream_id,
+                            records: vec![Record::new(Bytes::from(vec![value; 120 * 1024]))],
+                        }])
+                        .unwrap()
+                        .remove(0),
+                );
+            }
+            storage
+                .release_group(vec![ReleaseUnit { stream_id, ids }])
+                .unwrap();
+
+            let first = storage.reclaim(ReclaimKind::Automatic).unwrap();
+            assert_eq!(first.segments, 4);
+            assert!(storage.has_automatic_reclaim_work());
+            let second = storage.reclaim(ReclaimKind::Automatic).unwrap();
+            assert_eq!(second.segments, 4);
+            assert!(storage.has_automatic_reclaim_work());
+            let third = storage.reclaim(ReclaimKind::Automatic).unwrap();
+            assert_eq!(third.segments, 2);
+            assert!(!storage.has_automatic_reclaim_work());
+            assert_eq!(storage.maintenance_stats().automatic_reclaim_passes, 3);
+            assert_eq!(storage.maintenance_stats().manifest_compactions, 1);
+        }
+
+        let storage = Storage::open(compact_segments).unwrap();
+        assert_eq!(storage.stream_stats(stream_id).pending_records, 0);
+        assert_eq!(storage.storage_stats().unwrap().live_segments, 0);
+    }
+
+    #[test]
+    fn explicit_reclaim_finishes_all_bounded_batches_in_one_pass() {
+        let directory = TempDir::new().unwrap();
+        let stream_id = StreamId::new(10);
+        let config = Config::new(directory.path(), Capacity::Unbounded)
+            .with_max_epoch_bytes(128 * 1024)
+            .with_segment_bytes(160 * 1024)
+            .with_max_release_records(1024)
+            .with_max_commit_bytes(256 * 1024);
+        let mut storage = Storage::open(config).unwrap();
+        let mut ids = Vec::new();
+        for value in 0_u8..10 {
+            ids.extend(
+                storage
+                    .append_group(vec![AppendUnit {
+                        stream_id,
+                        records: vec![Record::new(Bytes::from(vec![value; 120 * 1024]))],
+                    }])
+                    .unwrap()
+                    .remove(0),
+            );
+        }
+        storage
+            .release_group(vec![ReleaseUnit { stream_id, ids }])
+            .unwrap();
+
+        let report = storage.reclaim(ReclaimKind::Explicit).unwrap();
+        assert_eq!(report.segments, 10);
+        assert_eq!(storage.maintenance_stats().explicit_reclaim_passes, 1);
+        assert_eq!(storage.maintenance_stats().reclaimed_segments, 10);
+        assert_eq!(storage.storage_stats().unwrap().live_segments, 0);
     }
 
     #[test]

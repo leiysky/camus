@@ -92,7 +92,7 @@ The main metric families are:
 | `camus_long_smoke_capacity_utilization_ratio` | maintenance-safe root waterline |
 | `actual_file_bytes`, `maintenance_headroom_bytes`, `data_admissible_bytes` | capacity accounting components |
 | `pending_records`, `pending_payload_bytes`, `segments`, `reclaimable_bytes` | logical backlog and physical lifecycle |
-| `waiters`, `waits_total`, `duration_seconds_*` | queue, readiness, capacity, and storage-job pressure |
+| `waiters`, `waits_total`, `duration_seconds_*` | queue admission, reactor dispatch, readiness, capacity, and per-kind storage-job pressure |
 | `interval_operation_records`, `operation_records_per_second` | interval append, read, and release throughput |
 | `interval_operation_latency_seconds` | interval p50, p95, and p99 caller-observed latency |
 | `interval_operation_latency_bucket` | cumulative fixed buckets per interval for whole-run quantiles |
