@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.95"
 publish = false
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

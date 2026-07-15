@@ -480,7 +480,10 @@ publishes or tags a release.
 
 ## License
 
-Camus is licensed under the [Apache License 2.0](LICENSE-APACHE).
+Current Camus development is licensed under the [MIT License](LICENSE-MIT).
+Published versions through `1.0.0-rc.2` remain under the
+[Apache License 2.0](https://github.com/leiysky/camus/blob/v1.0.0-rc.2/LICENSE-APACHE)
+included with those artifacts.
 
 [ci]: https://github.com/leiysky/camus/actions/workflows/ci.yml
 [ci-badge]: https://github.com/leiysky/camus/actions/workflows/ci.yml/badge.svg?branch=main
@@ -488,5 +491,5 @@ Camus is licensed under the [Apache License 2.0](LICENSE-APACHE).
 [crates-badge]: https://img.shields.io/crates/v/camus.svg
 [docs]: https://docs.rs/camus
 [docs-badge]: https://docs.rs/camus/badge.svg
-[license]: https://github.com/leiysky/camus/blob/main/LICENSE-APACHE
-[license-badge]: https://img.shields.io/crates/l/camus.svg
+[license]: https://github.com/leiysky/camus/blob/main/LICENSE-MIT
+[license-badge]: https://img.shields.io/badge/license-MIT-blue.svg
