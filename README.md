@@ -1,21 +1,100 @@
-# Camus
+# Camus · /kæmˈuː/
 
-Camus is a purpose-built embedded persistent buffer for opaque records. It is
-designed for local spools, embedded outboxes, upload staging, and durable
-write-behind workloads that follow one `append -> read -> release -> reclaim`
-lifecycle. An append that reports success remains recoverable until release is
-durable, providing an at-least-once storage handoff.
+[![crates.io][crates-badge]][crates] [![docs.rs][docs-badge]][docs] [![CI][ci-badge]][ci] [![license][license-badge]][license]
 
-Camus is not a general-purpose KV database or a message broker. It intentionally
-provides no arbitrary queries, mutable records, networking, consumer ownership,
-routing, retry scheduling, or exactly-once effects. The embedding application
-owns delivery policy and downstream idempotency.
+**An embedded persistent buffer with at-least-once storage handoff.**
+
+Camus durably stages opaque records between application code and an external
+effect. It is purpose-built for local spools, embedded outboxes, upload
+staging, and durable write-behind workloads. Once an append succeeds, the
+record remains recoverable until its exact release is durable.
+
+## At a glance
+
+- **Small lifecycle:** `append -> read -> release -> reclaim`.
+- **Logical multi-stream:** any number of lightweight stream namespaces share
+  efficient root-wide physical storage.
+- **Async readiness:** `Stream::read` waits for work and returns a non-empty,
+  owned, bounded snapshot; no callback or polling loop is required.
+- **Durable progress:** group commit amortizes syncs without weakening the
+  recovery outcome of an individual append or release.
+- **Explicit pressure:** capacity is unbounded or globally bounded with
+  `Block` or `RejectNew`; pending data is never silently evicted.
+- **Application-neutral bytes:** metadata and payload remain opaque, and
+  physical locations never enter the public API.
+
+Camus deliberately stops at the durable-buffer boundary. It is not a
+general-purpose KV database or message broker and provides no arbitrary
+queries, mutable records, networking, consumer ownership, retry scheduling,
+or exactly-once effects. The embedding application owns delivery policy and
+downstream idempotency.
 
 > **Compatibility commitment:** starting with `1.0.0-rc.1`, the public Rust API
 > follows Semantic Versioning and format-v1 roots remain readable by later
 > compatible releases. Incompatible persistent changes require a new explicit
 > format version and migration design. Earlier unpublished development roots
 > are outside this compatibility boundary.
+
+## Install
+
+Camus is currently available as a 1.0 release candidate:
+
+```toml
+[dependencies]
+camus = "1.0.0-rc.2"
+```
+
+The 1.0 production durability target is Linux on a validated local filesystem.
+macOS is supported as a development environment; see the
+[deployment envelope](#deployment-envelope) before production use.
+
+## Quick start
+
+The intended API composes directly in async application code:
+
+```rust,no_run
+use bytes::Bytes;
+use camus::{Capacity, Config, FullPolicy, Log, ReadLimits, Record, StreamId};
+
+async fn drain(root: &std::path::Path) -> camus::Result<()> {
+    let log = Log::open(Config::new(
+        root,
+        Capacity::Bounded {
+            total_bytes: 1024 * 1024 * 1024,
+            when_full: FullPolicy::Block,
+        },
+    ))
+    .await?;
+
+    let uploads = log.stream(StreamId::new(7));
+    uploads
+        .append(Record {
+            metadata: Bytes::from_static(b"content-type: example"),
+            payload: Bytes::from_static(b"opaque payload"),
+        })
+        .await?;
+
+    // read waits when this stream has no pending records. It never returns an
+    // empty snapshot merely to signal readiness.
+    let snapshot = uploads
+        .read(ReadLimits {
+            max_records: 128,
+            max_bytes: 8 * 1024 * 1024,
+        })
+        .await?;
+
+    let mut completed = Vec::new();
+    for record in snapshot {
+        make_downstream_effect_durable(&record).await?;
+        completed.push(record.id);
+    }
+    uploads.release(completed).await?;
+
+    log.shutdown().await
+}
+```
+
+Runnable, compiled versions of this lifecycle are in [examples](examples/).
 
 ## Core contract
 
@@ -51,7 +130,7 @@ If a process stops after the downstream effect but before release becomes
 durable, recovery returns the record again. Applications must make repeated
 effects safe when that matters.
 
-## Public API shape
+## API overview
 
 Potentially blocking storage work is async. Methods that only construct a
 handle or copy reactor-maintained state are synchronous and never perform
@@ -135,54 +214,6 @@ maintenance, and recovery state. Detailed pressure stats separate command
 queue admission from reactor dispatch time and split finite filesystem jobs by
 append, read, release, reclaim, and timer-driven rollover. Health is a separate
 low-frequency lifecycle view.
-
-## Example lifecycle
-
-The intended API composes directly in async application code:
-
-```rust,no_run
-use bytes::Bytes;
-use camus::{Capacity, Config, FullPolicy, Log, ReadLimits, Record, StreamId};
-
-async fn drain(root: &std::path::Path) -> camus::Result<()> {
-    let log = Log::open(Config::new(
-        root,
-        Capacity::Bounded {
-            total_bytes: 1024 * 1024 * 1024,
-            when_full: FullPolicy::Block,
-        },
-    ))
-    .await?;
-
-    let uploads = log.stream(StreamId::new(7));
-    uploads
-        .append(Record {
-            metadata: Bytes::from_static(b"content-type: example"),
-            payload: Bytes::from_static(b"opaque payload"),
-        })
-        .await?;
-
-    // read waits when this stream has no pending records. It never returns an
-    // empty snapshot merely to signal readiness.
-    let snapshot = uploads
-        .read(ReadLimits {
-            max_records: 128,
-            max_bytes: 8 * 1024 * 1024,
-        })
-        .await?;
-
-    let mut completed = Vec::new();
-    for record in snapshot {
-        make_downstream_effect_durable(&record).await?;
-        completed.push(record.id);
-    }
-    uploads.release(completed).await?;
-
-    log.shutdown().await
-}
-```
-
-Runnable, compiled versions of this lifecycle are in [examples](examples/).
 
 ## Read and release semantics
 
@@ -327,7 +358,7 @@ tracing, metrics, or exporter framework. See the
 [observability guide](docs/observability.md) for counter semantics and adapter
 guidance.
 
-## Appropriate uses and non-goals
+## Use cases and non-goals
 
 Camus fits local spools, embedded outboxes, upload staging, and durable
 write-behind buffers where the application wants a small persistent handoff
@@ -450,3 +481,12 @@ publishes or tags a release.
 ## License
 
 Camus is licensed under the [Apache License 2.0](LICENSE-APACHE).
+
+[ci]: https://github.com/leiysky/camus/actions/workflows/ci.yml
+[ci-badge]: https://github.com/leiysky/camus/actions/workflows/ci.yml/badge.svg?branch=main
+[crates]: https://crates.io/crates/camus
+[crates-badge]: https://img.shields.io/crates/v/camus.svg
+[docs]: https://docs.rs/camus
+[docs-badge]: https://docs.rs/camus/badge.svg
+[license]: https://github.com/leiysky/camus/blob/main/LICENSE-APACHE
+[license-badge]: https://img.shields.io/crates/l/camus.svg
