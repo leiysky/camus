@@ -129,6 +129,78 @@ system page cache. Cold-start measurement requires host-specific privileged
 cache control or a dataset larger than memory and belongs in a separate test
 protocol.
 
+## Application-scenario harness
+
+The `scenarios` command exercises Camus alone through four finite,
+application-shaped storage handoffs. It complements the isolated
+engine-comparison workloads: record construction, append, read, complete
+content validation, exact durable release, and final drain are all inside the
+end-to-end scenario interval. It does not simulate downstream network or
+service latency, because that would measure the application rather than the
+persistent buffer.
+
+Application names describe the byte flow only. Their metadata and payloads
+remain opaque to Camus, and the harness stays in the unpublished benchmark
+crate.
+
+| Scenario | Reference topology | Record and batching | Boundary exercised |
+| --- | --- | --- | --- |
+| `outbox_live_handoff` | 8 producers, 1 stream, 1 drain worker | 16,384 × (24 B metadata + 1 KiB payload); single-record append; reads of 128 | Contended single-destination durable handoff and group commit |
+| `telemetry_batch_spool` | 4 producers, 4 source streams, 4 drain workers | 131,072 × (24 B + 256 B); appends of 64; reads of 512 | Batched small-record ingest and independent stream readiness |
+| `upload_staging_recovery` | 4 producers, 4 staging streams | 512 × (24 B + 256 KiB); appends of 4; reads of 16 | Complete pending backlog, clean reopen, verified drain, and reclamation |
+| `multi_stream_write_behind` | 32 producers, 32 streams, 32 drain workers | 32,768 × (24 B + 4 KiB); single-record append; reads of 64 | Logical stream fan-out over one physical root |
+
+Run a fast correctness pass from the repository root:
+
+```sh
+cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
+  --no-default-features -- \
+  scenarios --profile smoke
+```
+
+For the fixed three-sample reference sizes, select a directory on the device
+being measured:
+
+```sh
+cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
+  --no-default-features -- \
+  scenarios --profile reference \
+  --data-directory /path/on/device/camus-scenario-data \
+  --output target/benchmark-results/scenarios-reference.json
+```
+
+Each consumer verifies every metadata and payload byte, rejects duplicates,
+checks strictly increasing Camus `RecordId` sequence numbers per stream, and
+matches append and release commit counters to the configured record count.
+Every sample must finish with zero pending records. The recovery scenario must
+also recover the complete configured backlog before draining it. Reported
+pending-record and physical-byte high-water marks are observations made after
+completed storage transitions, not continuous exact maxima.
+
+### Directional application-scenario reference
+
+The following report-schema-1 result is a three-sample controlled Linux run
+collected on 2026-07-16. It is directional, not a CI threshold. Latency cells
+are p99; `handoff` measures append start through successful durable release,
+while the staging scenario reports clean reopen latency in that column.
+
+| Scenario | records/s | logical MiB/s | append | release | handoff / reopen | observed pending high-water | Validation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Single-destination outbox | 5,631 | 5.63 | 2.161 ms | 2.251 ms | 5.460 ms | 24 | Full integrity and order; 0 pending |
+| Batched telemetry spool | 92,385 | 24.67 | 4.047 ms | 4.116 ms | 12.902 ms | 768 | Full integrity and order; 0 pending |
+| Restartable upload staging | 1,462 | 365.41 | 12.550 ms | 7.651 ms | 1.319 ms reopen | 512 | Recovered 512/512; full integrity and order; 0 pending |
+| 32-stream write-behind | 4,566 | 17.94 | 11.305 ms | 12.517 ms | 36.110 ms | 96 | Full integrity and order; 0 pending |
+
+The outbox grouped almost exactly eight concurrent single-record appends per
+durability group, so contention is amortized without turning the logical
+stream into a physical shard. Telemetry batching delivered the highest record
+rate. Large-object staging sustained the highest byte rate and reopened the
+complete 128 MiB logical backlog with a 1.319 ms p99 before draining it. The
+32-stream case remained correct under root-wide contention, but its 36.110 ms
+handoff p99 is the clearest candidate for future scheduling and dynamic
+sharding work. Median post-drain physical length stayed between 176 and 672
+bytes across the four scenarios.
+
 ## Manifest compaction diagnostic
 
 The standalone runner also has a Camus-only mixed-workload diagnostic for the

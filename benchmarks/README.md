@@ -26,6 +26,21 @@ cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
   run --engines camus,simple-append-file --profile smoke
 ```
 
+To exercise Camus through finite application-shaped handoff paths without any
+comparison-engine dependency:
+
+```sh
+cargo run --locked --release --manifest-path benchmarks/Cargo.toml \
+  --no-default-features -- \
+  scenarios --profile smoke
+```
+
+The four fixed scenarios cover a single-destination outbox, a batched
+telemetry spool, restartable large-object staging, and 32-stream write-behind.
+They validate opaque record contents, per-stream order, durable commit totals,
+restart recovery where applicable, and a complete final drain. Use
+`--profile reference` for the documented three-sample sizes.
+
 To measure foreground latency across one forced Camus manifest compaction,
 without compiling any comparison engine:
 
